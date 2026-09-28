@@ -27,6 +27,12 @@ public class ExecutorProperties {
     /** 单次提交的代码上限（UTF-8 字节数）。 */
     private int maxCodeBytes = 64 * 1024;
 
+    /** 单次提交的文件数上限（含入口文件与标准输入文件）。 */
+    private int maxFiles = 16;
+
+    /** 标准输入的字节上限。 */
+    private int maxStdinBytes = 8 * 1024;
+
     /** stdout / stderr 各自最多回传多少字节。 */
     private int maxOutputBytes = 64 * 1024;
 
@@ -74,6 +80,22 @@ public class ExecutorProperties {
 
     public int getMaxCodeBytes() {
         return maxCodeBytes;
+    }
+
+    public int getMaxFiles() {
+        return maxFiles;
+    }
+
+    public void setMaxFiles(int maxFiles) {
+        this.maxFiles = maxFiles;
+    }
+
+    public int getMaxStdinBytes() {
+        return maxStdinBytes;
+    }
+
+    public void setMaxStdinBytes(int maxStdinBytes) {
+        this.maxStdinBytes = maxStdinBytes;
     }
 
     public void setMaxCodeBytes(int maxCodeBytes) {

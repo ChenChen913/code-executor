@@ -60,7 +60,7 @@ public class DockerCodeRunner implements CodeRunner {
     }
 
     @Override
-    public ExecutionResponse run(String jobId, LanguageSpec spec, String code) {
+    public ExecutionResponse run(String jobId, LanguageSpec spec, SourceBundle source) {
         long startedAt = System.nanoTime();
         String containerId = null;
         PhaseOutcome compile = null;
@@ -69,14 +69,17 @@ public class DockerCodeRunner implements CodeRunner {
         try {
             containerId = createContainer(jobId, spec);
             docker.startContainerCmd(containerId).exec();
-            copySourceIntoContainer(containerId, spec, code.getBytes(StandardCharsets.UTF_8));
+            writeFiles(containerId, source);
 
             if (spec.hasCompileStep()) {
                 compile = execPhase(containerId, spec.getCompileCommand(), spec.getCompileTimeoutMs());
             }
             // 编译没过就不要再运行了：既省时间，也让返回给用户的错误更干净
             if (compile == null || compile.ok()) {
-                run = execPhase(containerId, spec.getRunCommand(), spec.getRunTimeoutMs());
+                List<String> runCommand = source.hasStdin()
+                        ? sandbox.withStdinRedirect(spec.getRunCommand())
+                        : spec.getRunCommand();
+                run = execPhase(containerId, runCommand, spec.getRunTimeoutMs());
             }
 
             boolean outOfMemory = isOomKilled(containerId);
@@ -131,7 +134,7 @@ public class DockerCodeRunner implements CodeRunner {
     }
 
     /**
-     * 把源码写进容器。
+     * 把所有源文件（以及标准输入文件）一次写进容器的工作目录。
      *
      * <p>⚠️ 这里不能用 {@code docker cp}。实测结论：{@code docker cp} 是守护进程按
      * "rootfs 里的路径"写的，看不到容器内部的 tmpfs 挂载，会被 {@code --read-only} 拒绝：
@@ -140,15 +143,15 @@ public class DockerCodeRunner implements CodeRunner {
      * Status 400: {"message":"container rootfs is marked read-only"}
      * </pre>
      *
-     * <p>也不用 exec 的 stdin：docker-java 那条路会挂住不返回（见
-     * {@link SandboxPolicy#sourceWriteCommand}里的说明）。
+     * <p>也不用 exec 的 stdin：docker-java 那条路会挂住不返回
+     * （见 {@link SandboxPolicy#writeFilesCommand} 里的说明）。
      *
-     * <p>最终走的是 {@code sh -c 'printf %s "$1" | base64 -d > "$2"'}，
-     * 源码以 base64 形式作为独立参数传入——不经过 shell 解析，也不可能注入。
+     * <p>最终走的是 {@code sh -c 'while [ $# -ge 2 ]; do printf %s "$1" | base64 -d > "$2"; shift 2; done'}，
+     * <b>一次 exec 写完所有文件</b>——多文件场景下不用为每个文件往返一次。
+     * 内容以 base64 作为独立参数传入，不经过 shell 解析，也不可能注入。
      */
-    private void copySourceIntoContainer(String containerId, LanguageSpec spec, byte[] code) {
-        String base64 = Base64.getEncoder().encodeToString(code);
-        List<String> command = sandbox.sourceWriteCommand(spec.getSourceFileName(), base64);
+    private void writeFiles(String containerId, SourceBundle source) {
+        List<String> command = sandbox.writeFilesCommand(source.files());
 
         PhaseOutcome outcome = execPhase(containerId, command, SOURCE_WRITE_TIMEOUT_MS);
         if (outcome.timedOut()) {

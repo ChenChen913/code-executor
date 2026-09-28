@@ -7,9 +7,9 @@ import com.github.dockerjava.api.model.Ulimit;
 import com.chenchen.codeexecutor.config.ExecutorProperties;
 import org.springframework.stereotype.Component;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -127,6 +127,15 @@ public class SandboxPolicy {
     public static final int MAX_ARGUMENT_BYTES = 120 * 1024;
 
     /**
+     * 所有参数合计的长度上限。
+     *
+     * <p>Linux 的 {@code ARG_MAX} 通常是 2 MB，这里取 256 KB 是刻意保守：
+     * 多文件 + stdin 场景下参数会明显变多，而这个服务根本不需要传那么多东西。
+     * 保守的代价只是"太大的请求被拒"，激进的代价是"内核报一个没人看得懂的 E2BIG"。
+     */
+    public static final int MAX_TOTAL_ARGUMENT_BYTES = 256 * 1024;
+
+    /**
      * 把源码写进容器所用的命令。
      *
      * <p><b>为什么不用 {@code docker cp}？</b>踩过坑，记录下来：
@@ -155,11 +164,45 @@ public class SandboxPolicy {
      * <p>实测验证过：把 {@code /workspace/a;id} 当文件名传进去，
      * 结果是创建了一个<b>名字叫 {@code a;id} 的文件</b>，而不是执行了 {@code id} 命令。
      *
-     * @param fileName       容器内的目标文件名（纯文件名，不含路径）
-     * @param base64Content  源码的 base64 编码
+     * @param files 有序的文件清单：容器内文件名 → 内容
      */
-    public List<String> sourceWriteCommand(String fileName, String base64Content) {
-        return List.of("sh", "-c", "printf %s \"$1\" | base64 -d > \"$2\"", "sh", base64Content, fileName);
+    public List<String> writeFilesCommand(Map<String, byte[]> files) {
+        List<String> command = new ArrayList<>();
+        command.add("sh");
+        command.add("-c");
+        // 循环每次吃掉两个位置参数（base64 内容 + 目标文件名），写完后 shift 掉。
+        // 脚本本身是常量，用户数据全部以位置参数传入。
+        command.add("while [ $# -ge 2 ]; do printf %s \"$1\" | base64 -d > \"$2\"; shift 2; done");
+        command.add("sh");  // $0，占位用
+        files.forEach((name, content) -> {
+            command.add(Base64.getEncoder().encodeToString(content));
+            command.add(name);
+        });
+        return command;
+    }
+
+    /**
+     * 给运行命令套一层标准输入重定向。
+     *
+     * <p>做法是把标准输入先写成容器里的一个文件，再让运行命令从它读：
+     *
+     * <pre>
+     * sh -c 'exec "$@" &lt; /workspace/.stdin' sh &lt;原本的运行命令...&gt;
+     * </pre>
+     *
+     * <p><b>为什么不用 docker exec 的 stdin？</b>试过，docker-java 的
+     * {@code ExecStartCmd.withStdIn(...)} 配合 {@code awaitCompletion} 会一直挂住
+     * （stdin 写完后对端等不到 EOF），每次只能等满超时才失败。这与第 6 章记录的
+     * "写源码"那个坑是同一个原因。
+     *
+     * <p>这里同样没有注入面：脚本是常量，运行命令来自语言配置（不是用户输入），
+     * 用户的 stdin 内容走的是<u>文件内容</u>而不是命令行。
+     */
+    public List<String> withStdinRedirect(List<String> runCommand) {
+        List<String> command = new ArrayList<>(List.of(
+                "sh", "-c", "exec \"$@\" < " + WORKSPACE + "/" + SourceBundle.STDIN_FILE, "sh"));
+        command.addAll(runCommand);
+        return command;
     }
 
     /** base64 编码后的长度（用于提前判断会不会超过参数长度上限）。 */
@@ -168,17 +211,43 @@ public class SandboxPolicy {
     }
 
     /**
+     * 演练模式专用的写文件命令简写。
+     *
+     * <p>真实命令里每个文件都是一大串 base64，原样打出来会把终端刷屏，
+     * 反而看不清整个流程。这里只保留结构和文件大小。
+     */
+    private List<String> abbreviatedWriteCommand(SourceBundle source) {
+        List<String> command = new ArrayList<>();
+        command.add("sh");
+        command.add("-c");
+        command.add("while [ $# -ge 2 ]; do printf %s \"$1\" | base64 -d > \"$2\"; shift 2; done");
+        command.add("sh");
+        source.files().forEach((name, content) -> {
+            command.add("<base64:" + content.length + "B>");
+            command.add(name);
+        });
+        return command;
+    }
+
+    /**
      * 渲染出等价的 docker 命令行，供演练模式和文档使用。
      *
      * <p>对不熟悉 Docker 的人，这一段比任何文字解释都直观：
      * 直接看到"我们到底给容器加了哪些限制"。
      */
-    public String describeRunPlan(String jobId, LanguageSpec spec, String code) {
+    public String describeRunPlan(String jobId, LanguageSpec spec, SourceBundle source) {
         List<String> lines = new ArrayList<>();
         lines.add("# 演练模式：以下命令没有被真正执行");
         lines.add("# 语言          : " + spec.getDisplayName() + "（" + spec.getId() + "）");
-        lines.add("# 代码大小      : " + code.getBytes(StandardCharsets.UTF_8).length + " 字节");
-        lines.add("# 容器内文件名  : " + spec.getSourceFileName());
+        lines.add("# 入口文件      : " + spec.getSourceFileName()
+                + "（" + source.files().get(spec.getSourceFileName()).length + " 字节）");
+        if (source.sourceFileCount() > 1) {
+            lines.add("# 附加文件      : " + (source.sourceFileCount() - 1) + " 个，合计 "
+                    + source.sourceBytes() + " 字节");
+        }
+        lines.add("# 标准输入      : " + (source.hasStdin()
+                ? source.files().get(SourceBundle.STDIN_FILE).length + " 字节"
+                : "无"));
         lines.add("");
         lines.add("docker run -d \\");
         lines.add("  --name code-executor-" + jobId + " \\");
@@ -202,15 +271,20 @@ public class SandboxPolicy {
         // 步骤编号按实际有没有编译阶段动态算，避免出现"1) 然后 3)"这种断号
         List<String> captions = new ArrayList<>();
         List<String> commands = new ArrayList<>();
-        captions.add("把源码写进容器（base64 走参数，不落宿主机磁盘，也不需要 docker cp）");
+        captions.add("把 " + source.sourceFileCount() + " 个源文件"
+                + (source.hasStdin() ? " + 标准输入" : "")
+                + " 写进容器（base64 走参数，一次 exec 写完，不落宿主机磁盘）");
         commands.add("docker exec code-executor-" + jobId + " "
-                + String.join(" ", sourceWriteCommand(spec.getSourceFileName(), "<base64>")));
+                + String.join(" ", abbreviatedWriteCommand(source)));
         if (spec.hasCompileStep()) {
             captions.add("编译");
             commands.add("docker exec code-executor-" + jobId + " " + String.join(" ", spec.getCompileCommand()));
         }
-        captions.add("运行");
-        commands.add("docker exec code-executor-" + jobId + " " + String.join(" ", spec.getRunCommand()));
+        captions.add("运行" + (source.hasStdin() ? "（标准输入已重定向）" : ""));
+        commands.add("docker exec code-executor-" + jobId + " "
+                + String.join(" ", source.hasStdin()
+                        ? withStdinRedirect(spec.getRunCommand())
+                        : spec.getRunCommand()));
         captions.add("清理（正常路径走这里；崩了则由回收器兜底）");
         commands.add("docker rm -f code-executor-" + jobId);
 

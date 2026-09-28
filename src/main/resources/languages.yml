@@ -39,9 +39,14 @@ executor:
       enabled: true
       source-file-name: main.py
       compile-command: [ ]
-      # -I 隔离模式：忽略 PYTHON* 环境变量和用户级 site-packages
-      # -B 不写 .pyc 文件（工作目录是 tmpfs，也没必要写）
-      run-command: [ "python3", "-I", "-B", "main.py" ]
+      # -E 忽略 PYTHON* 环境变量；-s 不加载用户级 site-packages；
+      # -B 不写 .pyc 文件（工作目录是 tmpfs，也没必要写）。
+      #
+      # ⚠️ 这里刻意【不用】-I。原因：-I 隐含 -P，而 -P 会阻止把脚本所在目录
+      #    加进 sys.path —— 于是 import helper 必然失败，多文件提交就用不了。
+      #    -P 想防的是"工作目录里有恶意模块覆盖标准库"，但那个目录里只有
+      #    用户自己提交的文件，防它没有意义，反而把正常功能禁掉了。
+      run-command: [ "python3", "-E", "-s", "-B", "main.py" ]
       run-timeout-ms: 5000
       memory-mb: 128
       pids-limit: 32

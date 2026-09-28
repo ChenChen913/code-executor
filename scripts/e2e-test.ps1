@@ -45,9 +45,18 @@ function Write-Section($title) {
 }
 
 function Invoke-Code {
-    param([string]$Language, [string]$Code, [int]$TimeoutSec = 90)
+    param(
+        [string]$Language,
+        [string]$Code,
+        [int]$TimeoutSec = 90,
+        [hashtable]$Files = $null,
+        [string]$Stdin = $null
+    )
 
-    $payload = @{ language = $Language; code = $Code } | ConvertTo-Json -Compress
+    $body = @{ language = $Language; code = $Code }
+    if ($Files) { $body.files = $Files }
+    if ($Stdin) { $body.stdin = $Stdin }
+    $payload = $body | ConvertTo-Json -Compress -Depth 5
     $inFile = [System.IO.Path]::GetTempFileName()
     $outFile = "$inFile.out"
     try {
@@ -205,6 +214,40 @@ Assert-That 'JavaScript 输出正确' { $js.stdout -match 'hello from node' -and
 
 $cjk = Invoke-Code -Language 'python' -Code 'print("中文输出测试：你好，世界 👋")'
 Assert-That 'UTF-8 中文与 emoji 正确回传' { $cjk.stdout -match '中文输出测试' -and $cjk.stdout -match '👋' } "stdout=$($cjk.stdout.Trim())"
+
+# ════════════════════════════════════════════════════════════════
+# 1.5 多文件与标准输入
+# ════════════════════════════════════════════════════════════════
+Write-Section '1.5 多文件与标准输入'
+
+$multiJava = Invoke-Code -Language 'java' -Code @'
+public class Main {
+    public static void main(String[] args) {
+        System.out.println(new Helper().greet());
+    }
+}
+'@ -Files @{ 'Helper.java' = 'public class Helper { public String greet(){ return "多文件 OK"; } }' }
+Assert-That 'Java 多文件：一次提交两个类' { $multiJava.status -eq 'SUCCESS' } "status=$($multiJava.status) duration=$($multiJava.durationMs)ms"
+Assert-That 'Java 多文件：跨文件调用成功' { $multiJava.stdout -match '多文件 OK' } "stdout=$($multiJava.stdout.Trim())"
+
+$multiPy = Invoke-Code -Language 'python' -Code @'
+import helper
+print(helper.double(21))
+'@ -Files @{ 'helper.py' = 'def double(x): return x * 2' }
+Assert-That 'Python 多文件：import 得到附加模块' { $multiPy.status -eq 'SUCCESS' -and $multiPy.stdout -match '42' } "status=$($multiPy.status) stdout=$($multiPy.stdout.Trim()) stderr=$(($multiPy.stderr -split "`n" | Select-Object -Last 2) -join ' / ')"
+
+$stdinPy = Invoke-Code -Language 'python' -Code @'
+import sys
+nums = [int(line) for line in sys.stdin if line.strip()]
+print("读了", len(nums), "个数字，和 =", sum(nums))
+'@ -Stdin "3`n4`n5`n"
+Assert-That 'stdin：程序能读到标准输入' { $stdinPy.status -eq 'SUCCESS' -and $stdinPy.stdout -match '和 = 12' } "status=$($stdinPy.status) stdout=$($stdinPy.stdout.Trim())"
+
+$traversal = Invoke-Code -Language 'python' -Code 'print(1)' -Files @{ '../../etc/passwd' = 'evil' }
+Assert-That '路径穿越的文件名被拒绝（400）' { $traversal.status -eq 400 -or $traversal.message -match '不合法' } "HTTP status=$($traversal.status) message=$($traversal.message)"
+
+$shadowEntry = Invoke-Code -Language 'python' -Code 'print(1)' -Files @{ 'main.py' = 'print("shadow")' }
+Assert-That '附加文件不能顶掉入口文件（400）' { $shadowEntry.status -eq 400 -or $shadowEntry.message -match '入口文件' } "message=$($shadowEntry.message)"
 
 # ════════════════════════════════════════════════════════════════
 # 2. 错误分类

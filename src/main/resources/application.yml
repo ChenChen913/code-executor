@@ -22,8 +22,14 @@ executor:
   dry-run: false
   # 容器内运行代码的用户，必须是非 root（镜像里创建了 uid=10001）
   user: "10001:10001"
-  # 单次提交的代码上限（UTF-8 字节）
+  # 单次提交的代码上限（UTF-8 字节）。多文件时是所有源文件【合计】。
+  # ⚠️ 不要超过 90 KB：源码是经命令行参数（base64）传进容器的，
+  #    而 Linux 单个参数上限是 128 KiB，base64 还会膨胀 1/3。
   max-code-bytes: 65536
+  # 单次提交的文件数上限（含入口文件与标准输入文件）
+  max-files: 16
+  # 标准输入的字节上限
+  max-stdin-bytes: 8192
   # stdout / stderr 各自最多回传多少字节，超出部分丢弃并标记 truncated
   max-output-bytes: 65536
   # 同时执行多少个请求，超出的直接返回 429（v1 不做排队）

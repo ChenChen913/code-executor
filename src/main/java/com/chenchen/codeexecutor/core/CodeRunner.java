@@ -18,9 +18,9 @@ public interface CodeRunner {
     /**
      * 在沙箱里跑一段代码。
      *
-     * @param jobId 本次执行 id，会写进容器标签，出问题时可以用它去捞容器
-     * @param spec  语言配方
-     * @param code  用户代码
+     * @param jobId  本次执行 id，会写进容器标签，出问题时可以用它去捞容器
+     * @param spec   语言配方
+     * @param source 要写进容器的全部文件（含可选的标准输入），已校验过
      */
-    ExecutionResponse run(String jobId, LanguageSpec spec, String code);
+    ExecutionResponse run(String jobId, LanguageSpec spec, SourceBundle source);
 }

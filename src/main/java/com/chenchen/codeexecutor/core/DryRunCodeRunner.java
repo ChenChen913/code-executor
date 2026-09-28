@@ -33,8 +33,8 @@ public class DryRunCodeRunner implements CodeRunner {
     }
 
     @Override
-    public ExecutionResponse run(String jobId, LanguageSpec spec, String code) {
-        String plan = sandbox.describeRunPlan(jobId, spec, code);
+    public ExecutionResponse run(String jobId, LanguageSpec spec, SourceBundle source) {
+        String plan = sandbox.describeRunPlan(jobId, spec, source);
         log.info("演练模式（未创建容器），等价的 docker 操作：\n{}", plan);
 
         // 把计划放在 stdout 里返回，这样用 curl 就能直接看到

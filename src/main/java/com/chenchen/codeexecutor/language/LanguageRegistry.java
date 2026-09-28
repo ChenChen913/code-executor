@@ -27,8 +27,6 @@ public class LanguageRegistry {
     private static final Logger log = LoggerFactory.getLogger(LanguageRegistry.class);
 
     /** 文件名长度上限，纯属防呆。 */
-    private static final int MAX_FILE_NAME_LENGTH = 64;
-
     private final Map<String, LanguageSpec> languages;
 
     public LanguageRegistry(ExecutorProperties properties) {
@@ -92,11 +90,11 @@ public class LanguageRegistry {
             throw new IllegalStateException(where + " 缺少 source-file-name");
         }
         // 关键的安全校验：文件名要拼进容器里的路径，绝不能带目录分隔符或 ..
-        String fileName = spec.getSourceFileName();
-        if (fileName.contains("/") || fileName.contains("\\") || fileName.contains("..")
-                || fileName.startsWith(".") || fileName.length() > MAX_FILE_NAME_LENGTH) {
+        // 规则与"用户提交的附加文件名"共用 FileNames，避免两处标准不一致
+        if (!FileNames.isValid(spec.getSourceFileName())) {
             throw new IllegalStateException(
-                    where + " 的 source-file-name 必须是不含路径的纯文件名，当前为：" + fileName);
+                    where + " 的 source-file-name「" + spec.getSourceFileName() + "」不合法："
+                            + FileNames.rule());
         }
 
         if (spec.isEnabled() && (spec.getRunCommand() == null || spec.getRunCommand().isEmpty())) {
