@@ -6,7 +6,7 @@
 原设计里缺失或不够严谨的地方（尤其是权限、网络、清理这三块）都做了补强，
 每一处改动和理由都写在 [docs/01-需求分析和设计.md](docs/01-需求分析和设计.md) 里。
 
-**状态：M0 已完成并通过真实容器验证**——31 个单元/集成测试 + 28 项端到端断言全部通过，
+**状态：M0 + API Key 鉴权已完成并通过真实容器验证**——54 个单元/集成测试 + 32 项端到端断言全部通过，
 不是"能编译"而已。实测数据见[测试报告](docs/05-测试报告.md)。
 
 > 不熟悉容器的话，先看[需求分析与设计文档的第 0 章](docs/01-需求分析和设计.md#第-0-章--技术背景容器隔离靠什么)：
@@ -49,6 +49,7 @@
 
 | 限制 | 作用 | 实测结果 |
 |---|---|---|
+| **API Key 鉴权** | 拦住"谁能调这个接口"。**默认开启，没配 key 就启动失败** | 不带 key → 401；带错 key → 401 |
 | `--network none` | 断网。挡住 SSRF 探测内网、外传数据、挖矿、当代理 | 连不上，DNS 也解析不出来 |
 | `--dns 127.0.0.1` | 不把宿主机 DNS 地址泄露给用户代码 | `/etc/resolv.conf` 里没有内网 IP |
 | `--read-only` | 根文件系统只读，改不了 `/etc`，装不了后门 | 写 `/etc` → `Read-only file system` |
@@ -90,15 +91,35 @@ docker build -t code-executor-runner:1 .
 
 ### 2. 启动服务
 
+先准备一个 API Key（**鉴权默认开启，没有 key 会启动失败**）：
+
+```bash
+export EXECUTOR_AUTH_KEYS_0_NAME=my-app
+export EXECUTOR_AUTH_KEYS_0_VALUE=$(openssl rand -base64 32)
+```
+
+```powershell
+# Windows PowerShell
+$env:EXECUTOR_AUTH_KEYS_0_NAME = 'my-app'
+$env:EXECUTOR_AUTH_KEYS_0_VALUE = [Convert]::ToBase64String((1..32 | ForEach-Object { Get-Random -Max 256 }))
+```
+
+然后启动：
+
 ```bash
 mvn spring-boot:run
 ```
+
+> 只想本地跑着玩、不想配 key：
+> `mvn spring-boot:run -Dspring-boot.run.arguments=--executor.auth.enabled=false`
+> （这个开关是刻意做得这么显眼的。）
 
 ### 3. 跑一段代码
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/executions \
   -H 'Content-Type: application/json' \
+  -H "X-API-Key: $EXECUTOR_AUTH_KEYS_0_VALUE" \
   -d '{"language":"python","code":"print(1+1)"}'
 ```
 
@@ -172,6 +193,7 @@ docker run -d \
 | HTTP | 场景 |
 |---|---|
 | `400` | 语言不支持 / 代码为空 / 代码超长 / JSON 格式错 |
+| `401` | 缺少或错误的 `X-API-Key` |
 | `429` | 并发已满（不排队，直接拒绝） |
 | `503` | Docker 连不上，或运行镜像没构建 |
 
@@ -211,6 +233,10 @@ executor:
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
+| `executor.auth.enabled` | `true` | API Key 鉴权。**没有配置 key 时启动失败** |
+| `executor.auth.header-name` | `X-API-Key` | 从哪个请求头取 key |
+| `executor.auth.keys[n].name` / `.value` | 空 | 调用方凭据。支持多个，用于 key 轮换 |
+| `executor.auth.public-paths` | `[/actuator/health]` | 免鉴权路径 |
 | `executor.image` | `code-executor-runner:1` | 运行用户代码的镜像 |
 | `executor.max-concurrent-executions` | `4` | 并发上限，超出返回 429 |
 | `executor.max-code-bytes` | `65536` | 单次提交代码上限，⚠️ **不要超过 90 KB** |
@@ -236,9 +262,10 @@ src/main/java/com/chenchen/codeexecutor/
 │   └── BoundedOutputStream.java← 输出截断，防 while(true) print
 ├── language/                   ← 语言抽象与注册表
 ├── model/                      ← 请求/响应/状态
+├── security/                   ← API Key 鉴权（过滤器 + 纯逻辑校验器）
 └── web/                        ← REST 接口与统一错误处理
 
-scripts/e2e-test.ps1            ← 28 项真实容器端到端测试
+scripts/e2e-test.ps1            ← 32 项真实容器端到端测试（含鉴权与安全回归）
 docs/                           ← 需求分析 / 部署 / 接口 / 安全 / 测试报告
 ```
 
@@ -247,25 +274,33 @@ docs/                           ← 需求分析 / 部署 / 接口 / 安全 / �
 ## 测试
 
 ```bash
-mvn test                                        # 31 个单元/集成测试，不需要 Docker
+mvn test                                        # 54 个单元/集成测试，不需要 Docker
 
-mvn spring-boot:run                             # 终端 1
-powershell -File scripts/e2e-test.ps1           # 终端 2：28 项真实容器断言
+mvn spring-boot:run                             # 终端 1（记得配 API Key）
+powershell -File scripts/e2e-test.ps1           # 终端 2：32 项真实容器断言
 ```
 
-端到端脚本覆盖三块：功能（三种语言）、错误分类（编译错/运行错/超时/OOM/截断）、
+端到端脚本覆盖四块：**鉴权**、功能（三种语言）、错误分类（编译错/运行错/超时/OOM/截断）、
 **安全回归（断网/只读/非 root/进程数限制/清理无残留）**。
 
-> 安全回归那一节的断言是**回归保护**：
-> 以后有人为了图方便删掉 `--network none`，脚本会直接红掉。
+> 鉴权和安全回归那两节的断言都是**回归保护**：
+> 以后有人为了图方便把鉴权关掉、或者删掉 `--network none`，脚本会直接红掉。
 
 ---
 
 ## ⚠️ 部署前必读
 
-### 1. 不要暴露到公网
+### 1. 鉴权已默认开启，但它是静态共享密钥
 
-**当前版本没有鉴权**，任何人都能调 `/api/v1/executions`。
+`executor.auth.enabled` 默认 `true`，没配 key 就起不来。但它有明确的边界：
+
+- **是共享密钥，不是身份体系。** 所有拿到同一个 key 的调用方在服务端看起来是同一个人，
+  日志里只有你给这个 key 起的 `name`
+- **没有过期、没有自动轮换。** 轮换靠配置多个 key 手工做：
+  加新 key → 部署 → 切换调用方 → 删旧 key
+- **没有按 key 的配额。** 一个 key 被打满，其他 key 一起受影响（M2）
+- **不做 TLS。** 这个服务只跑 HTTP，**必须由反向代理终止 HTTPS**，
+  否则 key 在网络上是明文
 
 ### 2. 不要把执行器容器化后挂 `docker.sock`
 
@@ -277,16 +312,25 @@ volumes:
 
 执行器持有 Docker socket，而 **Docker socket 等价于宿主机 root**——
 能访问它的人可以让 Docker 起一个挂载宿主机根目录的容器。
-再叠加"没有鉴权"，后果是：**任何能访问到这个端口的人 = 宿主机 root**。
+鉴权能挡住"随便什么人都能调接口"，但**挡不住拿到 key 之后的横向移动**。
 
 正确做法：执行器作为普通进程直接跑在宿主机上（systemd 示例见[部署文档](docs/02-部署文档.md)），
 用防火墙限制来源。
+
+### 3. 生产环境还缺什么
+
+鉴权只是让"能部署"这件事成立。离生产还有（详见[安全设计](docs/04-安全设计.md)第 4 节）：
+
+- 按调用方的配额与限流（M2）
+- 可观测：执行成功率、耗时分布、被杀原因统计（M2）
+- seccomp 自定义 profile、最小化镜像（M2）
+- 独立节点部署，与主业务、数据库物理隔离（M2）
 
 ---
 
 ## 已知限制
 
-- **没有鉴权**，只能内网用，别暴露公网
+- **鉴权是静态共享密钥**，没有过期、没有自动轮换、没有按 key 的配额
 - **不做排队**，并发满了直接 429
 - **同步接口**，编译型语言慢的时候调用方要自己等
 - **每请求一个容器**，冷启动开销实在（容器池在路线图上）

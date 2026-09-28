@@ -93,8 +93,22 @@ public class DockerCodeRunner implements CodeRunner {
                     "Docker 中找不到镜像 " + properties.getImage()
                             + "。请先在项目根目录执行：docker build -t " + properties.getImage() + " .", e);
         } catch (DockerException e) {
-            throw ApiException.sandboxUnavailable(
-                    "无法与 Docker 通信：" + e.getMessage() + "。请确认 Docker Desktop 已启动。", e);
+            throw ApiException.sandboxUnavailable("Docker 返回错误：" + rootMessage(e), e);
+        } catch (RuntimeException e) {
+            // ⚠️ 这一支是实测踩出来的：守护进程连不上时，docker-java 抛的是
+            // 【裸 RuntimeException 包着一个 IOException】——Windows 上是
+            //   java.lang.RuntimeException: java.nio.file.NoSuchFileException: \\.\pipe\dockerDesktopLinuxEngine
+            // 它不是 DockerException，上面两个 catch 都接不住，
+            // 于是"Docker 没启动"被报成了 500（执行器内部错误）而不是 503（沙箱不可用）。
+            // 这两者对调用方的含义完全不同：前者让人以为是自己代码的问题，
+            // 后者才正确表达"环境没准备好，别重试"。
+            if (hasIoCause(e)) {
+                throw ApiException.sandboxUnavailable(
+                        "连不上 Docker 守护进程：" + rootMessage(e)
+                                + "。请确认 Docker 已启动、executor.docker.host 配置正确。", e);
+            }
+            // 因果链里没有 IO 异常，说明是执行器自己的 bug，交给 500
+            throw e;
         } finally {
             // 放在 finally 里是刻意的：正常返回、抛异常、超时，都必须走到这里
             destroyQuietly(containerId);
@@ -267,6 +281,48 @@ public class DockerCodeRunner implements CodeRunner {
         } catch (IOException e) {
             // 关流失败不影响结果判断，忽略
         }
+    }
+
+    /**
+     * 判断一个异常是不是"连不上守护进程"这一类。
+     *
+     * <p>判据是<b>因果链里有没有 {@link IOException}</b>，而不是看异常类型。
+     * 原因是 docker-java 在这里的异常层次不统一：有时抛 {@code DockerException}，
+     * 有时抛裸 {@code RuntimeException} 包着 {@code NoSuchFileException} /
+     * {@code ConnectException} / {@code SocketException}——而这几个都是 {@code IOException} 的子类。
+     *
+     * <p>这个判据还顺带把两类问题分开了：<b>环境问题</b>（因果链里有 IO 异常）
+     * 和<b>代码 bug</b>（没有）。前者该返回 503，后者该返回 500。
+     */
+    static boolean hasIoCause(Throwable throwable) {
+        Throwable current = throwable;
+        // 加深度上限，防御因果链成环
+        for (int depth = 0; current != null && depth < 16; depth++) {
+            if (current instanceof IOException) {
+                return true;
+            }
+            Throwable cause = current.getCause();
+            if (cause == current) {
+                break;
+            }
+            current = cause;
+        }
+        return false;
+    }
+
+    /**
+     * 取因果链最底层的 message。
+     *
+     * <p>否则只会看到 {@code "java.lang.RuntimeException"} 这种无信息量的外层包装，
+     * 真正的 {@code NoSuchFileException: \\.\pipe\...} 会被埋掉。
+     */
+    static String rootMessage(Throwable throwable) {
+        Throwable current = throwable;
+        for (int depth = 0; current.getCause() != null && current.getCause() != current && depth < 16; depth++) {
+            current = current.getCause();
+        }
+        String message = current.getMessage();
+        return message == null ? current.getClass().getSimpleName() : message;
     }
 
     private static long elapsedMillis(long startedAtNanos) {

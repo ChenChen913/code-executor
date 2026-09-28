@@ -1,6 +1,7 @@
 package com.chenchen.codeexecutor;
 
 import com.chenchen.codeexecutor.config.ExecutorProperties;
+import com.chenchen.codeexecutor.security.AuthProperties;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -16,7 +17,7 @@ import org.springframework.scheduling.annotation.EnableScheduling;
  */
 @SpringBootApplication
 @EnableScheduling
-@EnableConfigurationProperties(ExecutorProperties.class)
+@EnableConfigurationProperties({ExecutorProperties.class, AuthProperties.class})
 public class CodeExecutorApplication {
 
     public static void main(String[] args) {

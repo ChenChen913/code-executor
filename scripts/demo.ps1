@@ -12,7 +12,10 @@
     powershell -File scripts/demo.ps1
 #>
 [CmdletBinding()]
-param([string]$BaseUrl = 'http://localhost:8080')
+param(
+    [string]$BaseUrl = 'http://localhost:8080',
+    [string]$ApiKey = $(if ($env:EXECUTOR_AUTH_KEYS_0_VALUE) { $env:EXECUTOR_AUTH_KEYS_0_VALUE } else { 'dev-local-key-0123456789abcdef' })
+)
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -25,7 +28,8 @@ function Send-Code {
     try {
         [System.IO.File]::WriteAllText($inFile, $payload, [System.Text.UTF8Encoding]::new($false))
         & curl.exe -s --max-time $TimeoutSec -X POST "$BaseUrl/api/v1/executions" `
-            -H 'Content-Type: application/json' --data-binary "@$inFile" -o $outFile | Out-Null
+            -H 'Content-Type: application/json' -H "X-API-Key: $ApiKey" `
+            --data-binary "@$inFile" -o $outFile | Out-Null
         return [System.IO.File]::ReadAllText($outFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
     } finally {
         Remove-Item $inFile, $outFile -Force -ErrorAction SilentlyContinue

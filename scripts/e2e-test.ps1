@@ -16,12 +16,20 @@
 .PARAMETER BaseUrl
     执行器地址，默认 http://localhost:8080
 
+.PARAMETER ApiKey
+    API Key。默认读环境变量 EXECUTOR_AUTH_KEYS_0_VALUE；
+    都没有时退回本地开发用的固定值（见 README 的快速开始）。
+
 .EXAMPLE
     pwsh -File scripts/e2e-test.ps1
+
+.EXAMPLE
+    pwsh -File scripts/e2e-test.ps1 -ApiKey 'your-real-key'
 #>
 [CmdletBinding()]
 param(
-    [string]$BaseUrl = 'http://localhost:8080'
+    [string]$BaseUrl = 'http://localhost:8080',
+    [string]$ApiKey = $(if ($env:EXECUTOR_AUTH_KEYS_0_VALUE) { $env:EXECUTOR_AUTH_KEYS_0_VALUE } else { 'dev-local-key-0123456789abcdef' })
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,7 +54,8 @@ function Invoke-Code {
         # 必须用无 BOM 的 UTF-8 写，否则 Spring 解析 JSON 会失败
         [System.IO.File]::WriteAllText($inFile, $payload, [System.Text.UTF8Encoding]::new($false))
         & curl.exe -s --max-time $TimeoutSec -X POST "$BaseUrl/api/v1/executions" `
-            -H 'Content-Type: application/json' --data-binary "@$inFile" -o $outFile | Out-Null
+            -H 'Content-Type: application/json' -H "X-API-Key: $ApiKey" `
+            --data-binary "@$inFile" -o $outFile | Out-Null
         if (-not (Test-Path $outFile) -or (Get-Item $outFile).Length -eq 0) {
             throw "执行器没有返回内容（超时或被拒绝）"
         }
@@ -115,7 +124,35 @@ try {
     Write-Host '         先启动：mvn spring-boot:run' -ForegroundColor Yellow
     exit 1
 }
-Assert-That '执行器健康检查' { $health.status -eq 'UP' } "status=$($health.status)"
+Assert-That '执行器健康检查（免鉴权）' { $health.status -eq 'UP' } "status=$($health.status)"
+
+# ── 鉴权 ────────────────────────────────────────────────────────
+# 这几条是"防止有人把鉴权关掉"的回归保护。
+$probeBody = '{"language":"python","code":"print(1)"}'
+$probeFile = [System.IO.Path]::GetTempFileName()
+[System.IO.File]::WriteAllText($probeFile, $probeBody, [System.Text.UTF8Encoding]::new($false))
+
+function Get-HttpStatus {
+    param([string]$HeaderArgs)
+    $args = @('-s', '-o', 'NUL', '-w', '%{http_code}', '-X', 'POST', "$BaseUrl/api/v1/executions",
+              '-H', 'Content-Type: application/json', '--data-binary', "@$probeFile")
+    if ($HeaderArgs) { $args += @('-H', $HeaderArgs) }
+    return (& curl.exe @args)
+}
+
+$statusNoKey = Get-HttpStatus -HeaderArgs ''
+Assert-That '不带 API Key → 401' { $statusNoKey -eq '401' } "HTTP $statusNoKey"
+
+$statusWrongKey = Get-HttpStatus -HeaderArgs 'X-API-Key: definitely-not-the-right-key'
+Assert-That '带错误 API Key → 401' { $statusWrongKey -eq '401' } "HTTP $statusWrongKey"
+
+$statusGoodKey = Get-HttpStatus -HeaderArgs "X-API-Key: $ApiKey"
+Assert-That '带正确 API Key → 200' { $statusGoodKey -eq '200' } "HTTP $statusGoodKey"
+
+$languagesNoKey = & curl.exe -s -o NUL -w '%{http_code}' "$BaseUrl/api/v1/languages"
+Assert-That '语言列表同样需要鉴权' { $languagesNoKey -eq '401' } "HTTP $languagesNoKey"
+
+Remove-Item $probeFile -Force -ErrorAction SilentlyContinue
 
 $dockerOk = $false
 try {
