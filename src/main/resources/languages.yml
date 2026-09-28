@@ -1,0 +1,57 @@
+# ============================================================
+# 语言配置
+# ------------------------------------------------------------
+# 加一门语言 = 在这里加一段配置，不用改任何 Java 代码。
+#
+# 字段说明：
+#   source-file-name  代码在容器里存成什么文件名（Java 要求类名与文件名一致）
+#   compile-command   编译命令，数组形式，一个元素一个参数。
+#                     数组形式是刻意的：命令不会被交给 shell 解释，
+#                     所以用户没法通过拼接字符串注入额外命令。
+#                     留空数组 [] 表示这门语言不需要编译。
+#   run-command       运行命令，同样用数组
+#   compile-timeout-ms 编译阶段超时
+#   run-timeout-ms     运行阶段超时
+#   memory-mb          这个容器最多能用多少内存，超了容器会被内核杀掉
+#   pids-limit         容器内最多能有几个进程/线程，防 fork 炸弹
+#
+# 命令里出现的文件名必须和 source-file-name 完全一致。
+# ============================================================
+executor:
+  languages:
+
+    java:
+      display-name: Java 17
+      enabled: true
+      source-file-name: Main.java
+      # -encoding UTF-8 防中文注释乱码；-d . 把 .class 输出到当前目录
+      compile-command: [ "javac", "-encoding", "UTF-8", "-d", ".", "Main.java" ]
+      # -Xmx64m 是 JVM 自己的堆上限（比容器内存更早触发，报错信息更友好）
+      # -XX:+UseSerialGC 避免 JVM 为了 GC 再开一堆线程
+      run-command: [ "java", "-XX:+UseSerialGC", "-Xmx64m", "-Dfile.encoding=UTF-8", "-cp", ".", "Main" ]
+      compile-timeout-ms: 20000
+      run-timeout-ms: 8000
+      memory-mb: 256
+      pids-limit: 64
+
+    python:
+      display-name: Python 3
+      enabled: true
+      source-file-name: main.py
+      compile-command: [ ]
+      # -I 隔离模式：忽略 PYTHON* 环境变量和用户级 site-packages
+      # -B 不写 .pyc 文件（工作目录是 tmpfs，也没必要写）
+      run-command: [ "python3", "-I", "-B", "main.py" ]
+      run-timeout-ms: 5000
+      memory-mb: 128
+      pids-limit: 32
+
+    javascript:
+      display-name: Node.js
+      enabled: true
+      source-file-name: main.js
+      compile-command: [ ]
+      run-command: [ "node", "main.js" ]
+      run-timeout-ms: 5000
+      memory-mb: 192
+      pids-limit: 32

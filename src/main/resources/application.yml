@@ -1,0 +1,63 @@
+server:
+  port: 8080
+  # 用户代码可能跑很久，给足等待时间；真正的超时由 executor.*-timeout-ms 控制
+  tomcat:
+    connection-timeout: 30s
+
+spring:
+  application:
+    name: code-executor
+  # 语言配置单独放一个文件，加语言不用改代码
+  config:
+    import: classpath:languages.yml
+  mvc:
+    problemdetails:
+      enabled: false
+
+executor:
+  # 运行用户代码的镜像（由本仓库根目录的 Dockerfile 构建）
+  image: code-executor-runner:1
+  # true = 只打印"将会下发的 docker 命令"，不真正执行。
+  # 适合：本机没装 Docker、或想先看懂流程的时候。
+  dry-run: false
+  # 容器内运行代码的用户，必须是非 root（镜像里创建了 uid=10001）
+  user: "10001:10001"
+  # 单次提交的代码上限（UTF-8 字节）
+  max-code-bytes: 65536
+  # stdout / stderr 各自最多回传多少字节，超出部分丢弃并标记 truncated
+  max-output-bytes: 65536
+  # 同时执行多少个请求，超出的直接返回 429（v1 不做排队）
+  max-concurrent-executions: 4
+  # 容器工作目录（tmpfs）与 /tmp 的大小
+  workspace-size-mb: 64
+  tmp-size-mb: 16
+  # 容器"保命"时长 = 编译超时 + 运行超时 + 这个余量（秒）
+  # 作用：即使执行器进程崩了，容器也会自己退出，不会永久泄漏
+  container-lifetime-slack-seconds: 30
+  docker:
+    # 留空 = 走 DOCKER_HOST 环境变量或默认 socket
+    # Linux/macOS: unix:///var/run/docker.sock   Windows: npipe:////./pipe/docker_engine
+    host: ""
+    connect-timeout-seconds: 10
+    # 留得比"最长的一次容器操作"更长
+    response-timeout-seconds: 120
+    max-connections: 32
+  reaper:
+    # 定时清理"漏网"的容器（执行器崩了、断电了、killed 了都可能留下）
+    enabled: true
+    interval-millis: 60000
+    # 创建后多久才允许被回收，避免误杀正在跑的容器
+    grace-seconds: 120
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+
+logging:
+  level:
+    com.chenchen.codeexecutor: INFO
