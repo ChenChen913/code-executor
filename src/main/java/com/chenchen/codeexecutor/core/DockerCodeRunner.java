@@ -7,10 +7,7 @@ import com.chenchen.codeexecutor.model.ExecutionResponse;
 import com.chenchen.codeexecutor.model.ExecutionStatus;
 import com.chenchen.codeexecutor.model.PhaseOutcome;
 import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.command.CreateContainerCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
-import com.github.dockerjava.api.exception.DockerException;
-import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.core.command.ExecStartResultCallback;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,27 +15,25 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.util.Base64;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 真刀真枪跑代码的实现：一个请求 = 一个全新容器。
+ * 真刀真枪跑代码的实现：<b>一个请求 = 一个容器，绝不复用</b>。
  *
- * <p>流程（对应文档里的业务流程）：
+ * <p>流程：
  * <ol>
- *   <li>创建容器（此时还没有代码）</li>
- *   <li>启动容器，它内部只是在 sleep，等着我们塞东西进去</li>
- *   <li>把源码用 tar 流直接写进容器的工作目录——<b>不落宿主机磁盘</b></li>
+ *   <li>取一个容器——优先从预热池里拿已经创建好的，拿不到就现场创建</li>
+ *   <li>把源码和 stdin 写进容器的工作目录（一次 exec 写完所有文件）</li>
  *   <li>有编译步骤就先编译，编译不过直接返回，不再运行</li>
  *   <li>运行，同时盯着超时</li>
  *   <li>不管是成功、报错、超时还是抛异常，最后一定删容器</li>
  * </ol>
  *
- * <p>和第 3 步相关的一个取舍：原文的做法是"先写宿主机临时文件，再复制进容器"。
- * 这里改成流式写入，省掉了宿主机临时文件，也就顺带消掉了两个隐患——
- * 文件名被拼成 {@code ../../etc/xxx} 的路径穿越，以及异常路径下临时文件残留。
+ * <p><b>关于预热池</b>：池子里放的是"从未被使用过"的容器，用完的容器一律销毁、
+ * 永不归还。复用型容器池能多省几十毫秒的销毁时间，但会让容器跨请求存活，
+ * 引入跨用户的状态泄漏风险——这个交换不划算。详见 {@link ContainerPool}。
  */
 @Component
 @ConditionalOnProperty(name = "executor.dry-run", havingValue = "false", matchIfMissing = true)
@@ -52,11 +47,19 @@ public class DockerCodeRunner implements CodeRunner {
     private final DockerClient docker;
     private final ExecutorProperties properties;
     private final SandboxPolicy sandbox;
+    private final ContainerFactory factory;
+    private final ContainerPool pool;
 
-    public DockerCodeRunner(DockerClient docker, ExecutorProperties properties, SandboxPolicy sandbox) {
+    public DockerCodeRunner(DockerClient docker,
+                            ExecutorProperties properties,
+                            SandboxPolicy sandbox,
+                            ContainerFactory factory,
+                            ContainerPool pool) {
         this.docker = docker;
         this.properties = properties;
         this.sandbox = sandbox;
+        this.factory = factory;
+        this.pool = pool;
     }
 
     @Override
@@ -67,8 +70,8 @@ public class DockerCodeRunner implements CodeRunner {
         PhaseOutcome run = null;
 
         try {
-            containerId = createContainer(jobId, spec);
-            docker.startContainerCmd(containerId).exec();
+            Acquired acquired = acquireContainer(jobId, spec);
+            containerId = acquired.containerId();
             writeFiles(containerId, source);
 
             if (spec.hasCompileStep()) {
@@ -86,51 +89,36 @@ public class DockerCodeRunner implements CodeRunner {
             ExecutionStatus status = decide(compile, run, outOfMemory);
             long durationMs = elapsedMillis(startedAt);
 
-            log.info("job={} language={} status={} duration={}ms",
-                    jobId, spec.getId(), status, durationMs);
+            log.info("job={} language={} status={} duration={}ms pooled={}",
+                    jobId, spec.getId(), status, durationMs, acquired.pooled());
             return ExecutionResponse.of(jobId, spec.getId(), status, compile, run,
                     durationMs, describe(status, spec, compile));
 
-        } catch (NotFoundException e) {
-            throw ApiException.sandboxUnavailable(
-                    "Docker 中找不到镜像 " + properties.getImage()
-                            + "。请先在项目根目录执行：docker build -t " + properties.getImage() + " .", e);
-        } catch (DockerException e) {
-            throw ApiException.sandboxUnavailable("Docker 返回错误：" + rootMessage(e), e);
-        } catch (RuntimeException e) {
-            // ⚠️ 这一支是实测踩出来的：守护进程连不上时，docker-java 抛的是
-            // 【裸 RuntimeException 包着一个 IOException】——Windows 上是
-            //   java.lang.RuntimeException: java.nio.file.NoSuchFileException: \\.\pipe\dockerDesktopLinuxEngine
-            // 它不是 DockerException，上面两个 catch 都接不住，
-            // 于是"Docker 没启动"被报成了 500（执行器内部错误）而不是 503（沙箱不可用）。
-            // 这两者对调用方的含义完全不同：前者让人以为是自己代码的问题，
-            // 后者才正确表达"环境没准备好，别重试"。
-            if (hasIoCause(e)) {
-                throw ApiException.sandboxUnavailable(
-                        "连不上 Docker 守护进程：" + rootMessage(e)
-                                + "。请确认 Docker 已启动、executor.docker.host 配置正确。", e);
-            }
-            // 因果链里没有 IO 异常，说明是执行器自己的 bug，交给 500
-            throw e;
         } finally {
-            // 放在 finally 里是刻意的：正常返回、抛异常、超时，都必须走到这里
-            destroyQuietly(containerId);
+            // 放在 finally 里是刻意的：正常返回、抛异常、超时，都必须走到这里。
+            // 用过的容器一律销毁，绝不归还到池子里——这是"绝不复用"的落实点。
+            factory.destroy(containerId);
         }
     }
 
-    private String createContainer(String jobId, LanguageSpec spec) {
-        CreateContainerCmd command = docker.createContainerCmd(properties.getImage())
-                .withName("code-executor-" + jobId)
-                .withUser(properties.getUser())
-                .withWorkingDir(SandboxPolicy.WORKSPACE)
-                .withEnv("HOME=/tmp", "TMPDIR=/tmp", "LANG=C.UTF-8")
-                .withLabels(sandbox.labels(jobId))
-                // 我们不用容器自身的 stdout，所有输出都从 exec 拿
-                .withAttachStdout(false)
-                .withAttachStderr(false)
-                .withCmd("sh", "-c", sandbox.keepAliveCommand(spec))
-                .withHostConfig(sandbox.hostConfig(spec));
-        return command.exec().getId();
+    /** 这次拿到的容器，以及它是不是来自预热池（只用于日志和观测）。 */
+    private record Acquired(String containerId, boolean pooled) {
+    }
+
+    /**
+     * 取一个容器：优先用预热池里的，拿不到就现场创建。
+     *
+     * <p>池子是优化不是依赖——池子空了、坏了，服务照样能用，只是慢一点。
+     */
+    private Acquired acquireContainer(String jobId, LanguageSpec spec) {
+        Optional<ContainerPool.Warm> warm = pool.acquire(spec);
+        if (warm.isPresent()) {
+            return new Acquired(warm.get().containerId(), true);
+        }
+        // 保命时长按"编译超时 + 运行超时 + 余量"算
+        int keepAliveSeconds = spec.totalTimeoutMs() / 1000
+                + properties.getContainerLifetimeSlackSeconds();
+        return new Acquired(factory.createAndStart(jobId, spec, keepAliveSeconds), false);
     }
 
     /**
@@ -257,18 +245,6 @@ public class DockerCodeRunner implements CodeRunner {
         };
     }
 
-    private void destroyQuietly(String containerId) {
-        if (containerId == null) {
-            return;
-        }
-        try {
-            docker.removeContainerCmd(containerId).withForce(true).exec();
-        } catch (RuntimeException e) {
-            // 删不掉不算致命，但一定要留日志：静默失败的清理 = 静默的内存泄漏
-            log.warn("删除容器 {} 失败，将由回收器兜底：{}", containerId, e.getMessage());
-        }
-    }
-
     private void killQuietly(String containerId, List<String> command) {
         try {
             docker.killContainerCmd(containerId).withSignal("KILL").exec();
@@ -284,48 +260,6 @@ public class DockerCodeRunner implements CodeRunner {
         } catch (IOException e) {
             // 关流失败不影响结果判断，忽略
         }
-    }
-
-    /**
-     * 判断一个异常是不是"连不上守护进程"这一类。
-     *
-     * <p>判据是<b>因果链里有没有 {@link IOException}</b>，而不是看异常类型。
-     * 原因是 docker-java 在这里的异常层次不统一：有时抛 {@code DockerException}，
-     * 有时抛裸 {@code RuntimeException} 包着 {@code NoSuchFileException} /
-     * {@code ConnectException} / {@code SocketException}——而这几个都是 {@code IOException} 的子类。
-     *
-     * <p>这个判据还顺带把两类问题分开了：<b>环境问题</b>（因果链里有 IO 异常）
-     * 和<b>代码 bug</b>（没有）。前者该返回 503，后者该返回 500。
-     */
-    static boolean hasIoCause(Throwable throwable) {
-        Throwable current = throwable;
-        // 加深度上限，防御因果链成环
-        for (int depth = 0; current != null && depth < 16; depth++) {
-            if (current instanceof IOException) {
-                return true;
-            }
-            Throwable cause = current.getCause();
-            if (cause == current) {
-                break;
-            }
-            current = cause;
-        }
-        return false;
-    }
-
-    /**
-     * 取因果链最底层的 message。
-     *
-     * <p>否则只会看到 {@code "java.lang.RuntimeException"} 这种无信息量的外层包装，
-     * 真正的 {@code NoSuchFileException: \\.\pipe\...} 会被埋掉。
-     */
-    static String rootMessage(Throwable throwable) {
-        Throwable current = throwable;
-        for (int depth = 0; current.getCause() != null && current.getCause() != current && depth < 16; depth++) {
-            current = current.getCause();
-        }
-        String message = current.getMessage();
-        return message == null ? current.getClass().getSimpleName() : message;
     }
 
     private static long elapsedMillis(long startedAtNanos) {

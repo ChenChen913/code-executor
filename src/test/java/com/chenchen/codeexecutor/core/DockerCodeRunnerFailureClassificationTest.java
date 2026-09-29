@@ -24,15 +24,15 @@ class DockerCodeRunnerFailureClassificationTest {
         Throwable real = new RuntimeException(
                 new NoSuchFileException("\\\\.\\pipe\\dockerDesktopLinuxEngine"));
 
-        assertThat(DockerCodeRunner.hasIoCause(real)).isTrue();
+        assertThat(ContainerFactory.hasIoCause(real)).isTrue();
     }
 
     @Test
     @DisplayName("ConnectException / SocketException 这类也判定为连接失败")
     void connectExceptionIsConnectionFailure() {
-        assertThat(DockerCodeRunner.hasIoCause(new RuntimeException(new ConnectException("Connection refused"))))
+        assertThat(ContainerFactory.hasIoCause(new RuntimeException(new ConnectException("Connection refused"))))
                 .isTrue();
-        assertThat(DockerCodeRunner.hasIoCause(new IOException("boom"))).isTrue();
+        assertThat(ContainerFactory.hasIoCause(new IOException("boom"))).isTrue();
     }
 
     @Test
@@ -42,16 +42,16 @@ class DockerCodeRunnerFailureClassificationTest {
                 new IllegalStateException("middle",
                         new java.io.UncheckedIOException(new IOException("root"))));
 
-        assertThat(DockerCodeRunner.hasIoCause(nested)).isTrue();
+        assertThat(ContainerFactory.hasIoCause(nested)).isTrue();
     }
 
     @Test
     @DisplayName("代码 bug 类异常不会被误判成环境问题——它必须是 500，不是 503")
     void plainBugIsNotConnectionFailure() {
-        assertThat(DockerCodeRunner.hasIoCause(new NullPointerException("dockerCmdExecFactory was not specified")))
+        assertThat(ContainerFactory.hasIoCause(new NullPointerException("dockerCmdExecFactory was not specified")))
                 .isFalse();
-        assertThat(DockerCodeRunner.hasIoCause(new IllegalArgumentException("bad language"))).isFalse();
-        assertThat(DockerCodeRunner.hasIoCause(new RuntimeException())).isFalse();
+        assertThat(ContainerFactory.hasIoCause(new IllegalArgumentException("bad language"))).isFalse();
+        assertThat(ContainerFactory.hasIoCause(new RuntimeException())).isFalse();
     }
 
     @Test
@@ -61,7 +61,7 @@ class DockerCodeRunnerFailureClassificationTest {
         RuntimeException b = new RuntimeException("b", a);
         a.initCause(b);   // 人为造环
 
-        assertThat(DockerCodeRunner.hasIoCause(b)).isFalse();
+        assertThat(ContainerFactory.hasIoCause(b)).isFalse();
     }
 
     @Test
@@ -70,7 +70,7 @@ class DockerCodeRunnerFailureClassificationTest {
         Throwable wrapped = new RuntimeException(
                 new NoSuchFileException("\\\\.\\pipe\\dockerDesktopLinuxEngine"));
 
-        assertThat(DockerCodeRunner.rootMessage(wrapped))
+        assertThat(ContainerFactory.rootMessage(wrapped))
                 .contains("dockerDesktopLinuxEngine")
                 .doesNotContain("java.lang.RuntimeException");
     }
@@ -78,6 +78,6 @@ class DockerCodeRunnerFailureClassificationTest {
     @Test
     @DisplayName("没有 message 时退回异常类名，不会返回 null")
     void rootMessageFallsBackToClassName() {
-        assertThat(DockerCodeRunner.rootMessage(new RuntimeException())).isEqualTo("RuntimeException");
+        assertThat(ContainerFactory.rootMessage(new RuntimeException())).isEqualTo("RuntimeException");
     }
 }

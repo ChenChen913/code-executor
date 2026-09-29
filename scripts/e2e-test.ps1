@@ -417,15 +417,25 @@ Assert-That '特权已丢弃：mount 不成功' { $caps.stdout -notmatch 'MOUNT_
 # ════════════════════════════════════════════════════════════════
 # 4. 清理
 # ════════════════════════════════════════════════════════════════
-Write-Section '4. 清理 — 跑完不能留下容器'
+Write-Section '4. 清理 — 用过的容器不能留下'
 
 Start-Sleep -Seconds 3
-$leftover = & docker ps -a --filter 'label=code-executor.managed=true' --format '{{.ID}} {{.Status}}' 2>$null
-$leftoverCount = if ($leftover) { @($leftover).Count } else { 0 }
-Assert-That '没有残留的受管容器' { $leftoverCount -eq 0 } "残留 $leftoverCount 个：$($leftover -join '; ')"
 
-$running = & docker ps -q 2>$null
-Assert-That 'Docker 中没有正在运行的容器' { -not $running } "运行中 $((@($running) | Where-Object { $_ }).Count) 个"
+# 注意：预热池里的容器是【预期存在】的，它们从没被使用过。
+# 这里要检查的是"用过的容器有没有被清理掉"，所以按命名把两类分开：
+#   code-executor-warm-<语言>-<随机>  → 池中预热容器，允许存在
+#   code-executor-<uuid>             → 某次执行租用的容器，必须消失
+$managed = & docker ps -a --filter 'label=code-executor.managed=true' --format '{{.Names}}' 2>$null
+$leased = @($managed) | Where-Object { $_ -and $_ -notmatch '^code-executor-warm-' }
+$leasedCount = @($leased).Count
+Assert-That '没有残留的「已使用」容器' { $leasedCount -eq 0 } "残留 $leasedCount 个：$($leased -join '; ')"
+
+$warmCount = @(@($managed) | Where-Object { $_ -match '^code-executor-warm-' }).Count
+Assert-That '剩下的都是预热容器（池子按预期保留）' { $warmCount -ge 0 } "预热容器 $warmCount 个：$(@($managed) -join '; ')"
+
+$running = & docker ps --format '{{.Names}}' 2>$null
+$runningLeased = @($running) | Where-Object { $_ -and $_ -notmatch '^code-executor-warm-' }
+Assert-That 'Docker 中运行着的容器都不是执行中的租用容器' { @($runningLeased).Count -eq 0 } "运行中 $((@($runningLeased)).Count) 个租用容器"
 
 # ════════════════════════════════════════════════════════════════
 # 汇总

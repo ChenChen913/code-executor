@@ -38,10 +38,12 @@ public class ContainerReaper {
 
     private final DockerClient docker;
     private final ExecutorProperties properties;
+    private final ContainerPool pool;
 
-    public ContainerReaper(DockerClient docker, ExecutorProperties properties) {
+    public ContainerReaper(DockerClient docker, ExecutorProperties properties, ContainerPool pool) {
         this.docker = docker;
         this.properties = properties;
+        this.pool = pool;
     }
 
     @Scheduled(fixedDelayString = "${executor.reaper.interval-millis:60000}")
@@ -68,7 +70,14 @@ public class ContainerReaper {
 
         long cutoff = Instant.now().getEpochSecond() - properties.getReaper().getGraceSeconds();
         int removed = 0;
+        int skippedWarm = 0;
         for (Container container : orphans) {
+            // 池子里的预热容器可能已经活了 5 分钟，超过保护期——但它们是健康的，不能删。
+            // 不做这个检查，回收器会每隔一分钟把池子清空一次，预热永远补不满。
+            if (pool.isPooled(container.getId())) {
+                skippedWarm++;
+                continue;
+            }
             if (createdAt(container) > cutoff) {
                 continue;
             }
@@ -82,7 +91,8 @@ public class ContainerReaper {
             }
         }
         if (removed > 0) {
-            log.info("本轮共回收 {} 个孤儿容器（当前共 {} 个受管容器）", removed, orphans.size());
+            log.info("本轮共回收 {} 个孤儿容器（受管容器共 {} 个，其中 {} 个在预热池中已跳过）",
+                    removed, orphans.size(), skippedWarm);
         }
     }
 

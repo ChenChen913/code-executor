@@ -51,6 +51,7 @@ public class ExecutorProperties {
     private Docker docker = new Docker();
     private Reaper reaper = new Reaper();
     private Async async = new Async();
+    private Pool pool = new Pool();
 
     /** 语言配置，key 是语言 id（java / python / ...）。 */
     private Map<String, LanguageSpec> languages = new LinkedHashMap<>();
@@ -165,6 +166,83 @@ public class ExecutorProperties {
 
     public void setAsync(Async async) {
         this.async = async;
+    }
+
+    public Pool getPool() {
+        return pool;
+    }
+
+    public void setPool(Pool pool) {
+        this.pool = pool;
+    }
+
+    /**
+     * 容器预热池配置。
+     *
+     * <p>池子里放的是"已经创建并启动、但从未被使用过"的容器。
+     * <b>用过的容器一律销毁，绝不归还</b>——省的是创建+启动的延迟，
+     * 而不是拿隔离性去换性能。
+     */
+    public static class Pool {
+
+        private boolean enabled = true;
+
+        /** 每种语言预热几个。1 个就能挡掉大部分冷启动；调大更抗并发，代价是常驻内存。 */
+        private int warmPerLanguage = 1;
+
+        /**
+         * 预热容器的保活时长（秒）。
+         *
+         * <p>比正常请求的保命时长长得多，否则容器还没被用上就自己退出了。
+         * 代价：执行器若崩溃，这些容器最多多活这么久（回收器会在重启后接手）。
+         */
+        private int warmKeepAliveSeconds = 300;
+
+        /** 补充池子的扫描间隔（毫秒）。 */
+        private long refillIntervalMillis = 5_000L;
+
+        /** 启动后多久开始预热（毫秒），给 Dokcer 和镜像检查留点时间。 */
+        private long initialDelayMillis = 3_000L;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public int getWarmPerLanguage() {
+            return warmPerLanguage;
+        }
+
+        public void setWarmPerLanguage(int warmPerLanguage) {
+            this.warmPerLanguage = warmPerLanguage;
+        }
+
+        public int getWarmKeepAliveSeconds() {
+            return warmKeepAliveSeconds;
+        }
+
+        public void setWarmKeepAliveSeconds(int warmKeepAliveSeconds) {
+            this.warmKeepAliveSeconds = warmKeepAliveSeconds;
+        }
+
+        public long getRefillIntervalMillis() {
+            return refillIntervalMillis;
+        }
+
+        public void setRefillIntervalMillis(long refillIntervalMillis) {
+            this.refillIntervalMillis = refillIntervalMillis;
+        }
+
+        public long getInitialDelayMillis() {
+            return initialDelayMillis;
+        }
+
+        public void setInitialDelayMillis(long initialDelayMillis) {
+            this.initialDelayMillis = initialDelayMillis;
+        }
     }
 
     /**
