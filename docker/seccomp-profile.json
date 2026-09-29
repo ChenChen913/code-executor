@@ -1,0 +1,92 @@
+{
+  "_comment": [
+    "代码执行器的 seccomp 策略。",
+    "",
+    "思路：以 Docker 默认 profile 为基础，再显式拒绝一批『沙箱里的普通程序永远不该用到』",
+    "的系统调用。这属于纵深防御——我们没有 capability，本来也做不了这些事，",
+    "但显式拒绝意味着即使将来有人不小心加了某个 capability，这些路依然是堵死的。",
+    "",
+    "刻意【不用】defaultAction: SCMP_ACT_ERRNO 的白名单模式：",
+    "白名单需要穷举所有语言运行时用到的系统调用（JVM / CPython / Node 加起来上百个），",
+    "漏一个就是『某个语言莫名跑不起来』，而且不同版本的运行时会用到不同的调用。",
+    "那种维护成本换来的安全增量，在这个场景下不划算。",
+    "",
+    "用法：executor.seccomp-profile 指向本文件在【Docker 守护进程所在机器】上的路径。",
+    "注意 Docker Desktop for Windows 上守护进程跑在 WSL 虚拟机里，",
+    "所以 Java 服务看到的路径和守护进程看到的路径不是一回事——详见部署文档。"
+  ],
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": ["SCMP_ARCH_ARM"]
+    }
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "acct",
+        "add_key",
+        "adjtimex",
+        "bpf",
+        "clock_adjtime",
+        "clock_settime",
+        "create_module",
+        "delete_module",
+        "fanotify_init",
+        "finit_module",
+        "get_kernel_syms",
+        "init_module",
+        "ioperm",
+        "iopl",
+        "kcmp",
+        "kexec_file_load",
+        "kexec_load",
+        "keyctl",
+        "lookup_dcookie",
+        "mount",
+        "move_pages",
+        "name_to_handle_at",
+        "nfsservctl",
+        "open_by_handle_at",
+        "perf_event_open",
+        "pivot_root",
+        "process_vm_readv",
+        "process_vm_writev",
+        "ptrace",
+        "query_module",
+        "quotactl",
+        "reboot",
+        "request_key",
+        "setdomainname",
+        "sethostname",
+        "setns",
+        "settimeofday",
+        "swapoff",
+        "swapon",
+        "sysfs",
+        "syslog",
+        "umount",
+        "umount2",
+        "unshare",
+        "userfaultfd",
+        "ustat",
+        "vm86",
+        "vm86old"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "comment": "1 = EPERM。用 EPERM 而不是 ENOSYS 是刻意的：让程序明确知道『不允许』，而不是以为内核不支持这个功能去走别的分支。"
+    },
+    {
+      "names": ["clone"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [],
+      "comment": "clone 必须放行（线程依赖它）；进程数由 cgroup 的 pids-limit 控制，不靠 seccomp。"
+    }
+  ]
+}

@@ -42,6 +42,16 @@ public class SandboxPolicy {
 
     private final ExecutorProperties properties;
 
+    /**
+     * seccomp profile 在 Docker 守护进程上的路径。空 = 用 Docker 默认 profile。
+     *
+     * <p>由 Spring 用 {@code @Value} 注入而不是从 {@link ExecutorProperties} 读，
+     * 是为了让它和 {@code executor.docker.host} 这类"跟宿主环境绑死"的配置放在一起，
+     * 一眼能看出它们是同一类东西。
+     */
+    @org.springframework.beans.factory.annotation.Value("${executor.seccomp-profile:}")
+    private String seccompProfile;
+
     public SandboxPolicy(ExecutorProperties properties) {
         this.properties = properties;
     }
@@ -66,6 +76,16 @@ public class SandboxPolicy {
     public HostConfig hostConfig(LanguageSpec spec) {
         long memoryBytes = spec.getMemoryMb() * 1024L * 1024L;
 
+        // 安全选项：no-new-privileges 是必须的；seccomp profile 配了才加。
+        //
+        // seccomp 的值必须是【Docker 守护进程所在机器】上的路径，不是 Java 服务看到的路径。
+        // 在 Linux 上两者是同一台机器；在 Docker Desktop for Windows 上守护进程跑在
+        // WSL 虚拟机里，Windows 路径它读不到 —— 详见部署文档。
+        List<String> securityOpts = new java.util.ArrayList<>(List.of("no-new-privileges"));
+        if (seccompProfile != null && !seccompProfile.isBlank()) {
+            securityOpts.add("seccomp=" + seccompProfile);
+        }
+
         return HostConfig.newHostConfig()
                 .withNetworkMode("none")
                 // 断网之后 Docker 依然会把宿主机的 nameserver 写进容器的 /etc/resolv.conf。
@@ -85,7 +105,7 @@ public class SandboxPolicy {
                         "/tmp", "rw,noexec,nosuid,nodev,size=" + properties.getTmpSizeMb() + "m,mode=1777"))
                 .withPrivileged(false)
                 .withCapDrop(Capability.ALL)
-                .withSecurityOpts(List.of("no-new-privileges"))
+                .withSecurityOpts(securityOpts)
                 .withMemory(memoryBytes)
                 // 和 memory 相等 = 禁用 swap，否则"内存超限"会被 swap 悄悄吃掉变成"慢得要死"
                 .withMemorySwap(memoryBytes)
