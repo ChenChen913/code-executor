@@ -23,7 +23,15 @@ public record ExecutionResponse(
         boolean truncated,
         boolean timedOut,
         long durationMs,
-        String message) {
+        String message,
+        /**
+         * 本次的编译是否来自缓存（编译产物缓存命中）。
+         *
+         * <p>刻意暴露出来：调用方看到"编译 0ms 完成"时应该知道是缓存命中，
+         * 而不是以为编译器突然变快了。不暴露的话，这个优化就成了一个
+         * 说不清来源的行为差异。
+         */
+        boolean compileCached) {
 
     /**
      * 由两个阶段的结果拼出最终响应。
@@ -41,6 +49,18 @@ public record ExecutionResponse(
                                        PhaseOutcome run,
                                        long durationMs,
                                        String message) {
+        return of(jobId, language, status, compile, run, durationMs, message, false);
+    }
+
+    /** 同上，额外的 {@code compileCached} 表示编译是否来自缓存。 */
+    public static ExecutionResponse of(String jobId,
+                                       String language,
+                                       ExecutionStatus status,
+                                       PhaseOutcome compile,
+                                       PhaseOutcome run,
+                                       long durationMs,
+                                       String message,
+                                       boolean compileCached) {
         String stdout = run == null ? "" : nullToEmpty(run.stdout());
         String stderr = run == null ? "" : nullToEmpty(run.stderr());
 
@@ -59,7 +79,8 @@ public record ExecutionResponse(
                 (compile != null && compile.truncated()) || (run != null && run.truncated()),
                 (compile != null && compile.timedOut()) || (run != null && run.timedOut()),
                 durationMs,
-                message);
+                message,
+                compileCached);
     }
 
     private static String joinOutput(PhaseOutcome phase) {

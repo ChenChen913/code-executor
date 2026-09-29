@@ -211,6 +211,28 @@ public class SandboxPolicy {
     }
 
     /**
+     * 把整个工作目录打包成 base64 导出——编译产物缓存的"存"这一步。
+     *
+     * <p>{@code -w 0} 是不换行的意思：换行会混进输出里，解码时就得先清理，
+     * 多一道容易出错的工序。
+     */
+    public List<String> exportWorkspaceCommand() {
+        return List.of("sh", "-c", "tar -cf - -C " + WORKSPACE + " . | base64 -w 0");
+    }
+
+    /**
+     * 把缓存的编译产物解包回工作目录——缓存命中的"取"这一步。
+     *
+     * <p>同样没有注入面：脚本是常量，base64 走 {@code $1}，
+     * 而 base64 字母表不含任何 shell 元字符。
+     */
+    public List<String> importWorkspaceCommand(String base64Artifact) {
+        return List.of("sh", "-c",
+                "printf %s \"$1\" | base64 -d | tar -xf - -C " + WORKSPACE,
+                "sh", base64Artifact);
+    }
+
+    /**
      * 演练模式专用的写文件命令简写。
      *
      * <p>真实命令里每个文件都是一大串 base64，原样打出来会把终端刷屏，

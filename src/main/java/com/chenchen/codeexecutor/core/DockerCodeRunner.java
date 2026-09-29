@@ -44,22 +44,28 @@ public class DockerCodeRunner implements CodeRunner {
     /** 写源码这一步的超时。只是往内存盘里写几十 KB，正常远小于 1 秒。 */
     private static final int SOURCE_WRITE_TIMEOUT_MS = 10_000;
 
+    /** 导出/恢复编译产物的超时。都是内存里的 tar 打包解包，正常几十毫秒。 */
+    private static final int ARTIFACT_TIMEOUT_MS = 15_000;
+
     private final DockerClient docker;
     private final ExecutorProperties properties;
     private final SandboxPolicy sandbox;
     private final ContainerFactory factory;
     private final ContainerPool pool;
+    private final CompileCache compileCache;
 
     public DockerCodeRunner(DockerClient docker,
                             ExecutorProperties properties,
                             SandboxPolicy sandbox,
                             ContainerFactory factory,
-                            ContainerPool pool) {
+                            ContainerPool pool,
+                            CompileCache compileCache) {
         this.docker = docker;
         this.properties = properties;
         this.sandbox = sandbox;
         this.factory = factory;
         this.pool = pool;
+        this.compileCache = compileCache;
     }
 
     @Override
@@ -68,15 +74,40 @@ public class DockerCodeRunner implements CodeRunner {
         String containerId = null;
         PhaseOutcome compile = null;
         PhaseOutcome run = null;
+        boolean compileCached = false;   // 局部变量，不做成字段（并发的单例 bean 里会互相覆盖）
 
         try {
             Acquired acquired = acquireContainer(jobId, spec);
             containerId = acquired.containerId();
+            // 立刻登记为"正在使用"：回收器靠这个标记避免误杀正在执行的容器。
+            // 漏掉这一步的后果很隐蔽——程序会跑到一半突然异常退出。
+            pool.markBusy(containerId);
             writeFiles(containerId, source);
 
-            if (spec.hasCompileStep()) {
-                compile = execPhase(containerId, spec.getCompileCommand(), spec.getCompileTimeoutMs());
+            // 缓存键在编译之前就算好：命中就跳过编译，没命中就在编译成功后回填
+            String cacheKey = null;
+            byte[] cachedArtifact = null;
+            if (spec.hasCompileStep() && properties.getCompileCache().isEnabled()) {
+                cacheKey = CompileCache.key(spec, source);
+                cachedArtifact = compileCache.get(cacheKey, spec.getId()).orElse(null);
             }
+
+            if (cachedArtifact != null) {
+                // 命中的产物与真跑一遍编译器得到的完全一致（键里含全部源码与编译命令），
+                // 所以这里直接当编译成功，并把 compileCached 标出来让调用方知道
+                importArtifacts(containerId, cachedArtifact);
+                compile = PhaseOutcome.finished(0, "", "", false);
+                compileCached = true;
+            } else if (spec.hasCompileStep()) {
+                compile = execPhase(containerId, spec.getCompileCommand(), spec.getCompileTimeoutMs());
+                if (compile.ok() && cacheKey != null) {
+                    byte[] artifact = exportArtifacts(containerId);
+                    if (artifact != null) {
+                        compileCache.put(cacheKey, artifact, spec.getId());
+                    }
+                }
+            }
+
             // 编译没过就不要再运行了：既省时间，也让返回给用户的错误更干净
             if (compile == null || compile.ok()) {
                 List<String> runCommand = source.hasStdin()
@@ -89,15 +120,53 @@ public class DockerCodeRunner implements CodeRunner {
             ExecutionStatus status = decide(compile, run, outOfMemory);
             long durationMs = elapsedMillis(startedAt);
 
-            log.info("job={} language={} status={} duration={}ms pooled={}",
-                    jobId, spec.getId(), status, durationMs, acquired.pooled());
+            log.info("job={} language={} status={} duration={}ms pooled={} compileCached={}",
+                    jobId, spec.getId(), status, durationMs, acquired.pooled(), compileCached);
             return ExecutionResponse.of(jobId, spec.getId(), status, compile, run,
-                    durationMs, describe(status, spec, compile));
+                    durationMs, describe(status, spec, compile), compileCached);
 
         } finally {
             // 放在 finally 里是刻意的：正常返回、抛异常、超时，都必须走到这里。
             // 用过的容器一律销毁，绝不归还到池子里——这是"绝不复用"的落实点。
             factory.destroy(containerId);
+            pool.unmarkBusy(containerId);
+        }
+    }
+
+    /**
+     * 把工作目录打包导出来，作为缓存产物。
+     *
+     * <p>失败一律返回 null 而不是抛异常——<b>缓存是优化，任何一环出问题都不该让执行失败</b>。
+     */
+    private byte[] exportArtifacts(String containerId) {
+        try {
+            // 输出上限给到产物上限的 base64 膨胀后再留点余量
+            int outputLimit = (int) (SandboxPolicy.base64Length(
+                    properties.getCompileCache().getMaxArtifactBytes()) + 4096);
+            PhaseOutcome outcome = execPhase(containerId, sandbox.exportWorkspaceCommand(),
+                    ARTIFACT_TIMEOUT_MS, outputLimit);
+            if (!outcome.ok() || outcome.truncated()) {
+                return null;
+            }
+            String base64 = outcome.stdout().trim();
+            if (base64.isEmpty()) {
+                return null;
+            }
+            return java.util.Base64.getDecoder().decode(base64);
+        } catch (RuntimeException e) {
+            log.debug("导出编译产物失败，本次不缓存：{}", e.getMessage());
+            return null;
+        }
+    }
+
+    /** 把缓存产物解包回工作目录。失败会抛出——因为此时跳过编译就成了错误的结果，不能装作没事。 */
+    private void importArtifacts(String containerId, byte[] artifact) {
+        String base64 = java.util.Base64.getEncoder().encodeToString(artifact);
+        PhaseOutcome outcome = execPhase(containerId,
+                sandbox.importWorkspaceCommand(base64), ARTIFACT_TIMEOUT_MS);
+        if (!outcome.ok()) {
+            throw ApiException.internal("恢复编译缓存失败（退出码 " + outcome.exitCode()
+                    + "）：" + outcome.stderr().trim());
         }
     }
 
@@ -159,6 +228,18 @@ public class DockerCodeRunner implements CodeRunner {
      * 文件名或参数里带上 {@code ;} 就能顺出额外的命令。
      */
     private PhaseOutcome execPhase(String containerId, List<String> command, int timeoutMs) {
+        return execPhase(containerId, command, timeoutMs, properties.getMaxOutputBytes());
+    }
+
+    /**
+     * 同上，但可以指定输出的字节上限。
+     *
+     * <p>只有导出编译产物那一步需要更大的上限——那是内部操作，
+     * 产物大小由 {@code compile-cache.max-artifact-bytes} 约束，
+     * 不是用户输出，不该套用 {@code max-output-bytes}。
+     */
+    private PhaseOutcome execPhase(String containerId, List<String> command,
+                                   int timeoutMs, int maxOutputBytes) {
         ExecCreateCmdResponse exec = docker.execCreateCmd(containerId)
                 .withCmd(command.toArray(new String[0]))
                 .withAttachStdout(true)
@@ -166,8 +247,8 @@ public class DockerCodeRunner implements CodeRunner {
                 .withWorkingDir(SandboxPolicy.WORKSPACE)
                 .exec();
 
-        BoundedOutputStream stdout = new BoundedOutputStream(properties.getMaxOutputBytes());
-        BoundedOutputStream stderr = new BoundedOutputStream(properties.getMaxOutputBytes());
+        BoundedOutputStream stdout = new BoundedOutputStream(maxOutputBytes);
+        BoundedOutputStream stderr = new BoundedOutputStream(maxOutputBytes);
         ExecStartResultCallback callback = new ExecStartResultCallback(stdout, stderr);
         boolean finished = false;
 

@@ -71,13 +71,35 @@ public class ContainerReaper {
         long cutoff = Instant.now().getEpochSecond() - properties.getReaper().getGraceSeconds();
         int removed = 0;
         int skippedWarm = 0;
+        int reclaimedLeakedWarm = 0;
         for (Container container : orphans) {
-            // 池子里的预热容器可能已经活了 5 分钟，超过保护期——但它们是健康的，不能删。
-            // 不做这个检查，回收器会每隔一分钟把池子清空一次，预热永远补不满。
-            if (pool.isPooled(container.getId())) {
+            String name = firstNameOf(container);
+            boolean looksWarm = name != null && name.contains("-warm-");
+            // ⚠️ 必须问池子"这个容器现在归你管吗"，而且它要把【已租出正在执行】也算进来。
+            // 早期版本只判断"在不在池子的队列里"，于是已租出的容器被判为泄漏当场删掉——
+            // 删的正是当前那次执行，表现为"死循环程序跑 2 秒就异常退出"这种极难归因的现象。
+            if (pool.isInUse(container.getId())) {
                 skippedWarm++;
                 continue;
             }
+
+            // ── 预热池对账 ──────────────────────────────────────────
+            // 名字像预热容器、却不在池子的记账里 —— 这就是"泄漏"：
+            // 它占着内存，池子还会另外补一个，于是数量缓慢上涨。
+            // 这类泄漏很难在代码里穷举所有成因，所以这里做一次对账兜底：
+            // 不管它是怎么漏出来的，只要对不上账就回收。
+            if (looksWarm) {
+                try {
+                    docker.removeContainerCmd(container.getId()).withForce(true).exec();
+                    reclaimedLeakedWarm++;
+                    log.warn("回收泄漏的预热容器 {}（{}）—— 不在池子记账里，说明有泄漏需要排查",
+                            shorten(container.getId()), name);
+                } catch (RuntimeException e) {
+                    log.warn("回收泄漏预热容器 {} 失败：{}", shorten(container.getId()), e.getMessage());
+                }
+                continue;
+            }
+
             if (createdAt(container) > cutoff) {
                 continue;
             }
@@ -90,10 +112,17 @@ public class ContainerReaper {
                 log.warn("回收容器 {} 失败：{}", shorten(container.getId()), e.getMessage());
             }
         }
-        if (removed > 0) {
-            log.info("本轮共回收 {} 个孤儿容器（受管容器共 {} 个，其中 {} 个在预热池中已跳过）",
-                    removed, orphans.size(), skippedWarm);
+        if (removed > 0 || reclaimedLeakedWarm > 0) {
+            log.info("本轮回收：孤儿容器 {} 个、泄漏的预热容器 {} 个"
+                            + "（受管容器共 {} 个，其中 {} 个在预热池中已跳过）",
+                    removed, reclaimedLeakedWarm, orphans.size(), skippedWarm);
         }
+    }
+
+    /** 容器的第一个名字（Docker 返回的名字带前导斜杠）。 */
+    private static String firstNameOf(Container container) {
+        String[] names = container.getNames();
+        return names == null || names.length == 0 ? null : names[0];
     }
 
     /**

@@ -30,12 +30,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 那是 Prometheus 内存爆炸的经典原因。调用方维度走配额与审计日志，不走指标。
  */
 @Component
-public class ExecutionMetrics {
+public class ExecutionMetrics implements CompileCache.Metrics {
 
     public static final String EXECUTIONS = "code_executor.executions";
     public static final String DURATION = "code_executor.execution.duration";
     public static final String ACTIVE = "code_executor.active.executions";
     public static final String REJECTED = "code_executor.rejected";
+    public static final String COMPILE_CACHE = "code_executor.compile.cache";
 
     private final MeterRegistry registry;
     private final AtomicInteger active = new AtomicInteger();
@@ -43,6 +44,16 @@ public class ExecutionMetrics {
     public ExecutionMetrics(MeterRegistry registry) {
         this.registry = registry;
         registry.gauge(ACTIVE, active, AtomicInteger::get);
+    }
+
+    @Override
+    public void compileCacheHit(String language) {
+        registry.counter(COMPILE_CACHE, "language", language, "result", "hit").increment();
+    }
+
+    @Override
+    public void compileCacheMiss(String language) {
+        registry.counter(COMPILE_CACHE, "language", language, "result", "miss").increment();
     }
 
     /** 一次执行结束（不管成功还是失败）时调用。 */

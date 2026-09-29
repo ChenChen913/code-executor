@@ -76,6 +76,14 @@ public class ContainerPool {
     private final Map<String, Deque<Warm>> pools = new ConcurrentHashMap<>();
 
     /**
+     * 已经租出去、正在执行用户代码的容器。
+     *
+     * <p>存在的唯一理由是让回收器知道"别碰这些"。
+     * 没有它，回收器会把正在执行的容器当孤儿删掉——实测踩过，见 {@link #isInUse}。
+     */
+    private final java.util.Set<String> busy = ConcurrentHashMap.newKeySet();
+
+    /**
      * 正在补货的语言。
      *
      * <p>用来防"补货踩踏"：高并发下十几个请求同时取走容器，如果每个都独立去创建替代品，
@@ -134,8 +142,13 @@ public class ContainerPool {
                 refillAsync(spec);
                 return Optional.of(candidate);
             }
-            // 已经死了（保命时长到了、或被人删了）——丢掉，继续看下一个
-            log.debug("预热容器 {} 已不在运行，丢弃", candidate.containerId());
+            // 判定为"已经不在运行"——不管是真的死了还是 inspect 偶发失败，
+            // 都必须【确保销毁】再丢掉。
+            // 早期版本这里只把它从队列里摘掉、不销毁：如果 isRunning 是误判，
+            // 那个容器就永远留在 Docker 里，而池子还会再补一个新的 —— 于是缓慢累积。
+            log.warn("预热容器 {} 状态异常，销毁后重新预热", candidate.containerId());
+            factory.destroy(candidate.containerId());
+            refillAsync(spec);
         }
         return Optional.empty();
     }
@@ -196,11 +209,13 @@ public class ContainerPool {
             factory.destroy(warm.containerId());
             return;
         }
-        if (isExpired(warm)) {
+        Deque<Warm> pool = pools.computeIfAbsent(warm.languageId(), k -> new ArrayDeque<>());
+        // 必须检查容量：否则"还回来"这个动作本身就能让池子超过目标数量
+        if (isExpired(warm) || pool.size() >= properties.getPool().getWarmPerLanguage()) {
             factory.destroy(warm.containerId());
             return;
         }
-        pools.computeIfAbsent(warm.languageId(), k -> new ArrayDeque<>()).addFirst(warm);
+        pool.addFirst(warm);
     }
 
     /** 销毁一个池中容器（不计入"已使用"）。 */
@@ -209,14 +224,22 @@ public class ContainerPool {
     }
 
     /**
-     * 这个容器是不是池子里的（用于回收器跳过）。
+     * 这个容器当前是不是"池子在管的"——包括<b>池中待用</b>和<b>已租出正在用</b>两种。
      *
-     * <p>必要性：池里的容器可能已经活了 300 秒，而回收器的保护期只有 120 秒——
-     * 不做这个检查，回收器会把健康的预热容器当成"孤儿"定期清掉，池子永远填不满。
+     * <p>⚠️ <b>这里必须把"已租出"也算进来，否则回收器会杀掉正在执行的请求。</b>
+     * 实测踩过：预热容器被租走后就不在池子的队列里了，
+     * 于是"名字像预热容器但不在记账里"的对账逻辑把它当成泄漏删掉——
+     * 删的正是当前那次执行，表现为"死循环程序跑 2 秒就异常退出"这种极难归因的现象。
+     *
+     * <p>同理，年龄检查也必须跳过它：预热容器可以合法地存活 300 秒，
+     * 远超回收器 120 秒的保护期。
      */
-    public boolean isPooled(String containerId) {
+    public boolean isInUse(String containerId) {
         if (containerId == null) {
             return false;
+        }
+        if (busy.contains(containerId)) {
+            return true;
         }
         for (Deque<Warm> pool : pools.values()) {
             for (Warm warm : pool) {
@@ -226,6 +249,25 @@ public class ContainerPool {
             }
         }
         return false;
+    }
+
+    /** 标记为"已租出、正在被使用"。必须在 {@link #acquire} 之后立刻调用。 */
+    public void markBusy(String containerId) {
+        if (containerId != null) {
+            busy.add(containerId);
+        }
+    }
+
+    /** 解除"正在被使用"标记。容器用完即毁，所以这一步只是让记账干净。 */
+    public void unmarkBusy(String containerId) {
+        if (containerId != null) {
+            busy.remove(containerId);
+        }
+    }
+
+    /** 当前正在被使用的容器个数，用于指标。 */
+    public int busyCount() {
+        return busy.size();
     }
 
     /** 池中容器总数，用于指标。 */
@@ -290,7 +332,10 @@ public class ContainerPool {
         String name = "warm-" + spec.getId() + "-" + UUID.randomUUID().toString().substring(0, 8);
         String containerId = factory.createAndStart(
                 name, spec, properties.getPool().getWarmKeepAliveSeconds());
-        log.debug("预热容器已就绪：{}（{}）", containerId, spec.getId());
+        // 用 INFO 而不是 DEBUG：这是低频事件（池子健康时根本不发生），
+        // 而它一旦变得高频，就说明池子在反复重建 —— 那正是运维需要看到的信号
+        log.info("预热容器已就绪：{}（{}），该语言池中现有 {} 个",
+                containerId, spec.getId(), size(spec.getId()));
         return new Warm(spec.getId(), containerId, Instant.now());
     }
 

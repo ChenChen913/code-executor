@@ -293,6 +293,43 @@ Assert-That '未知 taskId 返回 404' { $asyncMissing -eq '404' } "HTTP $asyncM
 Remove-Item $asyncIn, $asyncOut, "$asyncIn.poll" -Force -ErrorAction SilentlyContinue
 
 # ════════════════════════════════════════════════════════════════
+# 1.7 编译结果缓存
+# ════════════════════════════════════════════════════════════════
+Write-Section '1.7 编译缓存 — 相同源码不重复编译'
+
+# 用随机 nonce 保证每次跑都是"冷启动"，不受上一次运行留下的缓存影响
+$ccNonce = [guid]::NewGuid().ToString('N').Substring(0, 8)
+$ccCode = "public class Main { public static void main(String[] a){ System.out.println(`"cache-probe-$ccNonce-`" + (7*6)); } }"
+$ccFirst = Invoke-Code -Language 'java' -Code $ccCode
+$ccSecond = Invoke-Code -Language 'java' -Code $ccCode
+
+Assert-That '首次提交不命中缓存（要真的编译一遍）' {
+    $ccFirst.status -eq 'SUCCESS' -and $ccFirst.compileCached -eq $false
+} "compileCached=$($ccFirst.compileCached) duration=$($ccFirst.durationMs)ms"
+Assert-That '再次提交命中缓存，跳过编译' {
+    $ccSecond.compileCached -eq $true
+} "compileCached=$($ccSecond.compileCached) duration=$($ccSecond.durationMs)ms"
+Assert-That '命中缓存后结果依然正确（缓存产物与真编译一致）' {
+    $ccSecond.stdout -match "cache-probe-$ccNonce-42"
+} "stdout=$($ccSecond.stdout.Trim())"
+Assert-That '缓存命中确实更快' {
+    [int]$ccSecond.durationMs -lt [int]$ccFirst.durationMs
+} "首次 $($ccFirst.durationMs)ms → 命中 $($ccSecond.durationMs)ms"
+
+# 换一个字符就必须不命中——这是"缓存键包含全部源码"的回归保护
+$ccChanged = Invoke-Code -Language 'java' -Code $ccCode.Replace('7*6', '7*7')
+Assert-That '源码改一个字符就不命中缓存' {
+    $ccChanged.compileCached -eq $false -and $ccChanged.stdout -match "cache-probe-$ccNonce-49"
+} "compileCached=$($ccChanged.compileCached) stdout=$($ccChanged.stdout.Trim())"
+
+# 不缓存执行结果：同一段代码两次运行都要真的跑（否则"打印当前时间"会返回错的答案）
+$ccTime = Invoke-Code -Language 'java' -Code 'public class Main { public static void main(String[] a){ System.out.println(System.nanoTime()); } }'
+$ccTime2 = Invoke-Code -Language 'java' -Code 'public class Main { public static void main(String[] a){ System.out.println(System.nanoTime()); } }'
+Assert-That '只缓存编译产物，不缓存执行结果（两次输出不同）' {
+    $ccTime.stdout.Trim() -ne $ccTime2.stdout.Trim()
+} "两次输出：$($ccTime.stdout.Trim()) / $($ccTime2.stdout.Trim())"
+
+# ════════════════════════════════════════════════════════════════
 # 2. 错误分类
 # ════════════════════════════════════════════════════════════════
 Write-Section '2. 错误分类 — 用户要知道"为什么没跑成"'
@@ -433,9 +470,9 @@ Assert-That '没有残留的「已使用」容器' { $leasedCount -eq 0 } "残�
 $warmCount = @(@($managed) | Where-Object { $_ -match '^code-executor-warm-' }).Count
 Assert-That '剩下的都是预热容器（池子按预期保留）' { $warmCount -ge 0 } "预热容器 $warmCount 个：$(@($managed) -join '; ')"
 
-$running = & docker ps --format '{{.Names}}' 2>$null
+$running = & docker ps --filter 'label=code-executor.managed=true' --format '{{.Names}}' 2>$null
 $runningLeased = @($running) | Where-Object { $_ -and $_ -notmatch '^code-executor-warm-' }
-Assert-That 'Docker 中运行着的容器都不是执行中的租用容器' { @($runningLeased).Count -eq 0 } "运行中 $((@($runningLeased)).Count) 个租用容器"
+Assert-That '本项目没有正在运行中的「租用」容器' { @($runningLeased).Count -eq 0 } "运行中 $((@($runningLeased)).Count) 个租用容器"
 
 # ════════════════════════════════════════════════════════════════
 # 汇总

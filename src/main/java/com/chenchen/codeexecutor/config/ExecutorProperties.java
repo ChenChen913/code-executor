@@ -53,6 +53,7 @@ public class ExecutorProperties {
     private Async async = new Async();
     private Pool pool = new Pool();
     private Quota quota = new Quota();
+    private CompileCache compileCache = new CompileCache();
 
     /** 语言配置，key 是语言 id（java / python / ...）。 */
     private Map<String, LanguageSpec> languages = new LinkedHashMap<>();
@@ -185,6 +186,14 @@ public class ExecutorProperties {
         this.quota = quota;
     }
 
+    public CompileCache getCompileCache() {
+        return compileCache;
+    }
+
+    public void setCompileCache(CompileCache compileCache) {
+        this.compileCache = compileCache;
+    }
+
     /**
      * 按调用方的配额。
      *
@@ -292,6 +301,52 @@ public class ExecutorProperties {
 
         public void setInitialDelayMillis(long initialDelayMillis) {
             this.initialDelayMillis = initialDelayMillis;
+        }
+    }
+
+    /**
+     * 编译结果缓存。
+     *
+     * <p>只对"有编译步骤"的语言有意义。键是源码的 SHA-256，
+     * 所以命中缓存拿到的产物和真跑一遍编译器完全一致。
+     */
+    public static class CompileCache {
+
+        private boolean enabled = true;
+
+        /** 最多缓存多少份产物（LRU）。 */
+        private int maxEntries = 64;
+
+        /**
+         * 单份产物的字节上限。
+         *
+         * <p>不能调太大：产物塞回容器时走的是命令行参数，而 Linux 单个参数上限是 128 KiB，
+         * base64 还要膨胀 1/3。默认 64 KiB 留了充足余量。
+         */
+        private int maxArtifactBytes = 64 * 1024;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public int getMaxEntries() {
+            return maxEntries;
+        }
+
+        public void setMaxEntries(int maxEntries) {
+            this.maxEntries = maxEntries;
+        }
+
+        public int getMaxArtifactBytes() {
+            return maxArtifactBytes;
+        }
+
+        public void setMaxArtifactBytes(int maxArtifactBytes) {
+            this.maxArtifactBytes = maxArtifactBytes;
         }
     }
 
