@@ -118,16 +118,45 @@ executor:
       - /actuator/health
     # key 列表留空，全部从环境变量注入。
     # 支持多个 key 是为了让轮换可行：加新 key → 部署 → 切换调用方 → 删旧 key，全程不停机。
+    #
+    # 每个 key 还能单独配配额（0 = 用下面的全局默认，-1 = 不限）：
+    #   EXECUTOR_AUTH_KEYS_0_REQUESTS_PER_MINUTE=30
+    #   EXECUTOR_AUTH_KEYS_0_DAILY_QUOTA=2000
     keys: [ ]
+
+  # ============================================================
+  # 按调用方的配额
+  # ------------------------------------------------------------
+  # 全局并发上限保证"执行器不被压垮"；配额保证"某个调用方不把名额吃光"。
+  # 只有全局上限时，一个写错循环的调用方能让其他所有人收到 429。
+  #
+  # 注意：只有【提交执行】消耗配额，查询任务状态不消耗——
+  # 否则异步调用方正常轮询几下就把额度用光了。
+  # ============================================================
+  quota:
+    enabled: true
+    # 每分钟执行次数上限
+    default-requests-per-minute: 60
+    # 每日执行次数上限
+    default-daily-quota: 5000
 
 management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        # metrics / prometheus 用来做可观测。注意这两个端点也在鉴权范围内
+        # （只有 /actuator/health 是免鉴权的），别直接暴露到公网。
+        include: health,info,metrics,prometheus
   endpoint:
     health:
       show-details: never
+  metrics:
+    tags:
+      application: code-executor
+    distribution:
+      # 打开直方图，Prometheus 才能算出 P50/P95/P99
+      percentiles-histogram:
+        code_executor.execution.duration: true
 
 logging:
   level:

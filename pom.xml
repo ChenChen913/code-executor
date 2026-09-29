@@ -35,6 +35,13 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
+        <!-- 指标暴露给 Prometheus 抓取。
+             Actuator 自带 /actuator/metrics 可以看单个指标，但真正的可观测
+             要靠 Prometheus + Grafana，所以直接把 registry 接上。 -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
 
         <!-- 与 Docker daemon 通信。
              刻意不用聚合包 docker-java：它会带进 jersey + netty 两套传输实现，

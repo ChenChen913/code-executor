@@ -52,6 +52,7 @@ public class ExecutorProperties {
     private Reaper reaper = new Reaper();
     private Async async = new Async();
     private Pool pool = new Pool();
+    private Quota quota = new Quota();
 
     /** 语言配置，key 是语言 id（java / python / ...）。 */
     private Map<String, LanguageSpec> languages = new LinkedHashMap<>();
@@ -174,6 +175,55 @@ public class ExecutorProperties {
 
     public void setPool(Pool pool) {
         this.pool = pool;
+    }
+
+    public Quota getQuota() {
+        return quota;
+    }
+
+    public void setQuota(Quota quota) {
+        this.quota = quota;
+    }
+
+    /**
+     * 按调用方的配额。
+     *
+     * <p>全局并发上限保证"执行器不被压垮"，配额保证"某个调用方不把名额吃光"。
+     * 两者缺一不可：只有全局上限时，一个写错循环的调用方能让其他所有人收到 429。
+     */
+    public static class Quota {
+
+        private boolean enabled = true;
+
+        /** 调用方默认的每分钟执行次数上限。-1 = 不限，0 = 关闭这道限制。 */
+        private int defaultRequestsPerMinute = 60;
+
+        /** 调用方默认的每日执行次数上限。-1 = 不限，0 = 关闭这道限制。 */
+        private long defaultDailyQuota = 5000L;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public int getDefaultRequestsPerMinute() {
+            return defaultRequestsPerMinute;
+        }
+
+        public void setDefaultRequestsPerMinute(int defaultRequestsPerMinute) {
+            this.defaultRequestsPerMinute = defaultRequestsPerMinute;
+        }
+
+        public long getDefaultDailyQuota() {
+            return defaultDailyQuota;
+        }
+
+        public void setDefaultDailyQuota(long defaultDailyQuota) {
+            this.defaultDailyQuota = defaultDailyQuota;
+        }
     }
 
     /**

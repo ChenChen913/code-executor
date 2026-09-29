@@ -6,6 +6,7 @@ import com.chenchen.codeexecutor.language.LanguageRegistry;
 import com.chenchen.codeexecutor.language.LanguageSpec;
 import com.chenchen.codeexecutor.model.ExecutionRequest;
 import com.chenchen.codeexecutor.model.ExecutionResponse;
+import com.chenchen.codeexecutor.model.ExecutionStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -46,14 +47,17 @@ public class ExecutionService {
     private final LanguageRegistry languageRegistry;
     private final CodeRunner codeRunner;
     private final ExecutorProperties properties;
+    private final ExecutionMetrics metrics;
     private final Semaphore slots;
 
     public ExecutionService(LanguageRegistry languageRegistry,
                             CodeRunner codeRunner,
-                            ExecutorProperties properties) {
+                            ExecutorProperties properties,
+                            ExecutionMetrics metrics) {
         this.languageRegistry = languageRegistry;
         this.codeRunner = codeRunner;
         this.properties = properties;
+        this.metrics = metrics;
         this.slots = new Semaphore(Math.max(1, properties.getMaxConcurrentExecutions()));
     }
 
@@ -153,14 +157,25 @@ public class ExecutionService {
 
     private ExecutionResponse runPrepared(String jobId, PreparedExecution prepared) {
         LanguageSpec spec = prepared.spec();
+        long startedAt = System.nanoTime();
+        metrics.executionStarted();
         try {
-            return codeRunner.run(jobId, spec, prepared.source());
+            ExecutionResponse response = codeRunner.run(jobId, spec, prepared.source());
+            metrics.recordExecution(spec.getId(), response.status(), response.durationMs());
+            return response;
         } catch (ApiException e) {
+            // 被拒绝 / 沙箱不可用 —— 这两类要单独计数，它们是"运维要看的信号"，
+            // 混进正常的执行计数里会被淹没
+            metrics.recordRejected(String.valueOf(e.getStatus().value()));
             log.warn("job={} language={} 执行失败：{}", jobId, spec.getId(), e.getMessage());
             throw e;
         } catch (RuntimeException e) {
+            metrics.recordExecution(spec.getId(), ExecutionStatus.INTERNAL_ERROR,
+                    (System.nanoTime() - startedAt) / 1_000_000L);
             log.error("job={} language={} 出现未预期错误", jobId, spec.getId(), e);
             throw e;
+        } finally {
+            metrics.executionFinished();
         }
     }
 }

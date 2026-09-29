@@ -32,8 +32,12 @@ import java.util.Map;
  * </ul>
  */
 @Component
+@org.springframework.core.annotation.Order(ApiKeyAuthFilter.ORDER)
 @ConditionalOnProperty(name = "executor.auth.enabled", havingValue = "true", matchIfMissing = true)
 public class ApiKeyAuthFilter extends OncePerRequestFilter {
+
+    /** 鉴权必须跑在配额检查之前——配额是按调用方算的，得先知道是谁。 */
+    public static final int ORDER = 10;
 
     private static final Logger log = LoggerFactory.getLogger(ApiKeyAuthFilter.class);
 

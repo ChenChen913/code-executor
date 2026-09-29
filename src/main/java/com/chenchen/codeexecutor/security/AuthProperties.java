@@ -79,6 +79,12 @@ public class AuthProperties {
         /** 密钥本身。 */
         private String value;
 
+        /** 该调用方每分钟最多提交多少次执行。0 = 用全局默认，-1 = 不限。 */
+        private Integer requestsPerMinute = 0;
+
+        /** 该调用方每天最多提交多少次执行。0 = 用全局默认，-1 = 不限。 */
+        private Long dailyQuota = 0L;
+
         public String getName() {
             return name;
         }
@@ -93,6 +99,24 @@ public class AuthProperties {
 
         public void setValue(String value) {
             this.value = value;
+        }
+
+        /** 该调用方每分钟最多提交多少次执行。0 = 用全局默认，-1 = 不限。 */
+        public Integer getRequestsPerMinute() {
+            return requestsPerMinute;
+        }
+
+        public void setRequestsPerMinute(Integer requestsPerMinute) {
+            this.requestsPerMinute = requestsPerMinute;
+        }
+
+        /** 该调用方每天最多提交多少次执行。0 = 用全局默认，-1 = 不限。 */
+        public Long getDailyQuota() {
+            return dailyQuota;
+        }
+
+        public void setDailyQuota(Long dailyQuota) {
+            this.dailyQuota = dailyQuota;
         }
     }
 }

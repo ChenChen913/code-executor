@@ -96,10 +96,13 @@ public class ContainerPool {
                 return t;
             });
 
-    public ContainerPool(ContainerFactory factory, LanguageRegistry languages, ExecutorProperties properties) {
+    public ContainerPool(ContainerFactory factory, LanguageRegistry languages, ExecutorProperties properties,
+                         io.micrometer.core.instrument.MeterRegistry registry) {
         this.factory = factory;
         this.languages = languages;
         this.properties = properties;
+        // 池子大小做成指标：它能直接回答"预热是不是在正常工作"
+        registry.gauge("code_executor.pool.size", this, ContainerPool::size);
         if (properties.getPool().isEnabled()) {
             log.info("容器预热池已启用：每种语言预热 {} 个，容器保活 {}s，补充间隔 {}ms",
                     properties.getPool().getWarmPerLanguage(),
