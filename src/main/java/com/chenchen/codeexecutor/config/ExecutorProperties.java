@@ -50,6 +50,7 @@ public class ExecutorProperties {
 
     private Docker docker = new Docker();
     private Reaper reaper = new Reaper();
+    private Async async = new Async();
 
     /** 语言配置，key 是语言 id（java / python / ...）。 */
     private Map<String, LanguageSpec> languages = new LinkedHashMap<>();
@@ -156,6 +157,104 @@ public class ExecutorProperties {
 
     public void setReaper(Reaper reaper) {
         this.reaper = reaper;
+    }
+
+    public Async getAsync() {
+        return async;
+    }
+
+    public void setAsync(Async async) {
+        this.async = async;
+    }
+
+    /**
+     * 异步任务（{@code POST /api/v1/tasks}）的配置。
+     *
+     * <p>关掉之后 {@code /api/v1/tasks} 下的接口会直接不存在（返回 404），
+     * 同步接口不受影响。
+     */
+    public static class Async {
+
+        private boolean enabled = true;
+
+        /**
+         * 工作线程数。
+         *
+         * <p><b>不应小于 {@code max-concurrent-executions}</b>：工作线程抢到并发名额才执行，
+         * 线程比名额少就意味着名额永远用不满。启动时会检查并告警。
+         */
+        private int workerThreads = 4;
+
+        /** 队列容量。满了直接拒绝（429），不无限堆积。 */
+        private int queueCapacity = 64;
+
+        /** 排队等待执行名额的最长时间（毫秒），超时则任务失败。 */
+        private long maxQueueWaitMs = 60_000L;
+
+        /** 任务结果保留时长（秒）。过期后查询返回 404。 */
+        private long taskTtlSeconds = 600L;
+
+        /** 保留的任务总数上限，防止堆积吃光内存。 */
+        private int maxRetainedTasks = 1000;
+
+        /** 过期任务清理的扫描间隔（毫秒）。 */
+        private long sweepIntervalMillis = 30_000L;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public int getWorkerThreads() {
+            return workerThreads;
+        }
+
+        public void setWorkerThreads(int workerThreads) {
+            this.workerThreads = workerThreads;
+        }
+
+        public int getQueueCapacity() {
+            return queueCapacity;
+        }
+
+        public void setQueueCapacity(int queueCapacity) {
+            this.queueCapacity = queueCapacity;
+        }
+
+        public long getMaxQueueWaitMs() {
+            return maxQueueWaitMs;
+        }
+
+        public void setMaxQueueWaitMs(long maxQueueWaitMs) {
+            this.maxQueueWaitMs = maxQueueWaitMs;
+        }
+
+        public long getTaskTtlSeconds() {
+            return taskTtlSeconds;
+        }
+
+        public void setTaskTtlSeconds(long taskTtlSeconds) {
+            this.taskTtlSeconds = taskTtlSeconds;
+        }
+
+        public int getMaxRetainedTasks() {
+            return maxRetainedTasks;
+        }
+
+        public void setMaxRetainedTasks(int maxRetainedTasks) {
+            this.maxRetainedTasks = maxRetainedTasks;
+        }
+
+        public long getSweepIntervalMillis() {
+            return sweepIntervalMillis;
+        }
+
+        public void setSweepIntervalMillis(long sweepIntervalMillis) {
+            this.sweepIntervalMillis = sweepIntervalMillis;
+        }
     }
 
     public Map<String, LanguageSpec> getLanguages() {

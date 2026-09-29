@@ -250,6 +250,49 @@ $shadowEntry = Invoke-Code -Language 'python' -Code 'print(1)' -Files @{ 'main.p
 Assert-That '附加文件不能顶掉入口文件（400）' { $shadowEntry.status -eq 400 -or $shadowEntry.message -match '入口文件' } "message=$($shadowEntry.message)"
 
 # ════════════════════════════════════════════════════════════════
+# 1.6 异步任务接口
+# ════════════════════════════════════════════════════════════════
+Write-Section '1.6 异步任务 — 提交后拿 taskId，轮询取结果'
+
+$asyncBody = '{"language":"java","code":"public class Main { public static void main(String[] a) throws Exception { System.out.println(\"async ok\"); } }"}'
+$asyncIn = [System.IO.Path]::GetTempFileName()
+$asyncOut = "$asyncIn.out"
+[System.IO.File]::WriteAllText($asyncIn, $asyncBody, [System.Text.UTF8Encoding]::new($false))
+
+$submitCode = & curl.exe -s -o $asyncOut -w '%{http_code}' -X POST "$BaseUrl/api/v1/tasks" `
+    -H 'Content-Type: application/json' -H "X-API-Key: $ApiKey" --data-binary "@$asyncIn"
+$task = [System.IO.File]::ReadAllText($asyncOut, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+
+Assert-That '异步提交返回 202 Accepted' { $submitCode -eq '202' } "HTTP $submitCode"
+Assert-That '异步提交立即返回 taskId（不阻塞等结果）' { $task.taskId } "taskId=$($task.taskId)"
+
+$final = $null
+$polls = 0
+for ($i = 0; $i -lt 80; $i++) {
+    $polls = $i + 1
+    $pollOut = "$asyncIn.poll"
+    & curl.exe -s -o $pollOut "$BaseUrl/api/v1/tasks/$($task.taskId)" -H "X-API-Key: $ApiKey" | Out-Null
+    $final = [System.IO.File]::ReadAllText($pollOut, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    if ($final.status -eq 'COMPLETED' -or $final.status -eq 'FAILED') { break }
+    Start-Sleep -Milliseconds 300
+}
+Assert-That '轮询最终拿到 COMPLETED' { $final.status -eq 'COMPLETED' } "status=$($final.status)，轮询 $polls 次"
+Assert-That '任务状态与代码状态是两层，各说各的' { $final.status -eq 'COMPLETED' -and $final.result.status -eq 'SUCCESS' } "task=$($final.status) code=$($final.result.status)"
+Assert-That '异步执行结果正确' { $final.result.stdout -match 'async ok' } "stdout=$($final.result.stdout.Trim())"
+
+$asyncBadLang = & curl.exe -s -o NUL -w '%{http_code}' -X POST "$BaseUrl/api/v1/tasks" `
+    -H 'Content-Type: application/json' -H "X-API-Key: $ApiKey" -d '{"language":"cobol","code":"x"}'
+Assert-That '异步接口的校验是同步做的（坏语言立刻 400）' { $asyncBadLang -eq '400' } "HTTP $asyncBadLang"
+
+$asyncNoAuth = & curl.exe -s -o NUL -w '%{http_code}' "$BaseUrl/api/v1/tasks/$($task.taskId)"
+Assert-That '任务查询同样需要鉴权' { $asyncNoAuth -eq '401' } "HTTP $asyncNoAuth"
+
+$asyncMissing = & curl.exe -s -o NUL -w '%{http_code}' "$BaseUrl/api/v1/tasks/00000000-0000-0000-0000-000000000000" -H "X-API-Key: $ApiKey"
+Assert-That '未知 taskId 返回 404' { $asyncMissing -eq '404' } "HTTP $asyncMissing"
+
+Remove-Item $asyncIn, $asyncOut, "$asyncIn.poll" -Force -ErrorAction SilentlyContinue
+
+# ════════════════════════════════════════════════════════════════
 # 2. 错误分类
 # ════════════════════════════════════════════════════════════════
 Write-Section '2. 错误分类 — 用户要知道"为什么没跑成"'

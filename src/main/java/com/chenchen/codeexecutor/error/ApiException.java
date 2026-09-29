@@ -32,6 +32,16 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.INTERNAL_SERVER_ERROR, message);
     }
 
+    /** 404：资源不存在（比如任务 id 查不到，或结果已过期被清理）。 */
+    public static ApiException notFound(String message) {
+        return new ApiException(HttpStatus.NOT_FOUND, message);
+    }
+
+    /** 409：资源当前状态不允许这个操作（比如取消一个已经在跑的任务）。 */
+    public static ApiException conflict(String message) {
+        return new ApiException(HttpStatus.CONFLICT, message);
+    }
+
     /** 429：执行器忙不过来。 */
     public static ApiException tooManyRequests(String message) {
         return new ApiException(HttpStatus.TOO_MANY_REQUESTS, message);

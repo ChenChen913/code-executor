@@ -14,14 +14,29 @@ import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 执行入口：做校验、限流，然后把活交给 {@link CodeRunner}。
  *
- * <p>并发控制用的是"拿不到就拒绝"（信号量 + 立即返回 429），而不是排队。
- * 理由：排队会让用户看到的延迟变得不可预测——同一段代码有时 1 秒有时 30 秒，
- * 而这种接口通常是被别的服务调用的，调用方更需要"快速失败"而不是"慢慢等"。
- * 真正需要排队时应该由调用方用消息队列自己做，那样重试和优先级都更好控制。
+ * <p>这里同时服务两条路径，它们的排队策略<b>刻意不同</b>：
+ *
+ * <table border="1">
+ *   <caption>同步 vs 异步</caption>
+ *   <tr><th></th><th>拿不到名额时</th><th>为什么</th></tr>
+ *   <tr>
+ *     <td>同步 {@link #execute}</td>
+ *     <td>立刻返回 429</td>
+ *     <td>调用方在等结果，让它挂 30 秒比让它快速失败再重试更糟</td>
+ *   </tr>
+ *   <tr>
+ *     <td>异步 {@link #executeQueued}</td>
+ *     <td>排队等待（有上限）</td>
+ *     <td>调用方已经拿到 taskId 走了，排队对它没有体验损失</td>
+ *   </tr>
+ * </table>
+ *
+ * <p>两条路径共用同一个信号量——否则异步任务可以把同步请求饿死。
  */
 @Service
 public class ExecutionService {
@@ -42,7 +57,18 @@ public class ExecutionService {
         this.slots = new Semaphore(Math.max(1, properties.getMaxConcurrentExecutions()));
     }
 
-    public ExecutionResponse execute(ExecutionRequest request) {
+    /** 校验过、随时可以执行的一次请求。 */
+    public record PreparedExecution(LanguageSpec spec, SourceBundle source) {
+    }
+
+    /**
+     * 校验并组装请求，但不占用任何资源。
+     *
+     * <p>把这一步单独拆出来，是为了让异步路径能<b>在入队时就完成校验</b>——
+     * 一个语言名拼错的请求应该立刻收到 400，而不是先拿到一个 taskId，
+     * 轮询半天之后才发现任务失败了。
+     */
+    public PreparedExecution prepare(ExecutionRequest request) {
         LanguageSpec spec = languageRegistry.require(request.getLanguage());
 
         // 组装 + 校验所有要写进容器的文件。
@@ -77,22 +103,64 @@ public class ExecutionService {
                             + SandboxPolicy.MAX_TOTAL_ARGUMENT_BYTES + " 字节");
         }
 
+        return new PreparedExecution(spec, source);
+    }
+
+    /**
+     * 同步执行：拿不到名额就立刻拒绝。
+     *
+     * @throws ApiException 429，当并发已满时
+     */
+    public ExecutionResponse execute(ExecutionRequest request) {
+        PreparedExecution prepared = prepare(request);
+
         if (!slots.tryAcquire()) {
             throw ApiException.tooManyRequests(
-                    "执行器并发已满（上限 " + properties.getMaxConcurrentExecutions() + "），请稍后重试");
+                    "执行器并发已满（上限 " + properties.getMaxConcurrentExecutions()
+                            + "），请稍后重试。如果不想被拒绝，可以改用异步接口 POST /api/v1/tasks");
         }
 
-        String jobId = UUID.randomUUID().toString();
         try {
-            return codeRunner.run(jobId, spec, source);
+            return runPrepared(UUID.randomUUID().toString(), prepared);
+        } finally {
+            slots.release();
+        }
+    }
+
+    /**
+     * 排队执行：最多等 {@code maxWaitMs} 毫秒拿名额，拿不到才失败。
+     *
+     * <p>供异步路径使用。注意这里用的是 {@code tryAcquire(timeout)} 而不是
+     * 无限期的 {@code acquire()}——排队也必须有个上限，
+     * 否则一个卡住的任务会把调用方的轮询永远吊着。
+     *
+     * @throws ApiException 429，当等待超时时
+     */
+    public ExecutionResponse executeQueued(String jobId, PreparedExecution prepared, long maxWaitMs)
+            throws InterruptedException {
+
+        if (!slots.tryAcquire(maxWaitMs, TimeUnit.MILLISECONDS)) {
+            throw ApiException.tooManyRequests(
+                    "排队等待执行名额超时（" + maxWaitMs + "ms）。当前并发上限 "
+                            + properties.getMaxConcurrentExecutions());
+        }
+        try {
+            return runPrepared(jobId, prepared);
+        } finally {
+            slots.release();
+        }
+    }
+
+    private ExecutionResponse runPrepared(String jobId, PreparedExecution prepared) {
+        LanguageSpec spec = prepared.spec();
+        try {
+            return codeRunner.run(jobId, spec, prepared.source());
         } catch (ApiException e) {
             log.warn("job={} language={} 执行失败：{}", jobId, spec.getId(), e.getMessage());
             throw e;
         } catch (RuntimeException e) {
             log.error("job={} language={} 出现未预期错误", jobId, spec.getId(), e);
             throw e;
-        } finally {
-            slots.release();
         }
     }
 }
