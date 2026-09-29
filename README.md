@@ -1,372 +1,332 @@
-# code-executor
+<h1 align="center">在线代码执行器</h1>
 
-把一个「跑一段代码」的需求，变成一个**安全、可复用**的 HTTP 接口。
+<p align="center">
+  <b>简体中文</b> | <a href="./README_EN.md">English</a>
+  <br><br>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+</p>
 
-这是跟着《在线代码执行器实现教程（1 - 需求分析和设计）》做出来的实现，但**不是照抄**：
-原设计里缺失或不够严谨的地方（尤其是权限、网络、清理这三块）都做了补强，
-每一处改动和理由都写在 [docs/01-需求分析和设计.md](docs/01-需求分析和设计.md) 里。
+在线代码执行器：Spring Boot + Docker 的多语言代码沙箱。一请求一容器、绝不复用，15 项加固默认开启（断网、只读根文件系统、非 root、能力全丢、pids/内存/CPU 限额）。
 
-**状态：M1／M2 已完成，M3 未开始**——115 个单元/集成测试 + 53 项真实容器端到端断言全部通过，
-> 进度、未完成项、环境限制的完整清单见 **[docs/06-进度与交接.md](docs/06-进度与交接.md)**。
-> 原状态（M0 + API Key 鉴权）：
-不是"能编译"而已。实测数据见[测试报告](docs/05-测试报告.md)。
+仓库里没有截图或 GIF，下面用真实的端到端测试输出代替。
 
-> 不熟悉容器的话，先看[需求分析与设计文档的第 0 章](docs/01-需求分析和设计.md#第-0-章--技术背景容器隔离靠什么)：
-> 讲清了 namespace / cgroup / capability / seccomp 各管什么、`--read-only` 的能力边界在哪，
-> 以及 `docker exec` 与 `docker cp` 为什么是两条不同的路径。后面每一条加固参数都能对到机制上。
+```text
+──────────────────────────────────────────────────────────────
+  1. 功能 — 三种语言各跑一次
+──────────────────────────────────────────────────────────────
+  [PASS] Python 执行成功
+         status=SUCCESS exitCode=0 duration=188ms
+  [PASS] Java 编译+运行成功
+         status=SUCCESS duration=289ms
+  [PASS] JavaScript 执行成功
+         status=SUCCESS duration=238ms
+  [PASS] UTF-8 中文与 emoji 正确回传
+         stdout=中文输出测试：你好，世界 👋
 
----
+──────────────────────────────────────────────────────────────
+  3. 安全回归
+──────────────────────────────────────────────────────────────
+  [PASS] 断网：容器内连不上外网
+         stdout=NETWORK_BLOCKED:OSError
+  [PASS] 只读根文件系统：写不了 /etc
+         stdout=ROOTFS_READONLY:OSError
+  [PASS] 非 root 运行：uid 不是 0
+         stdout=UID=10001
+  [PASS] 进程数限制：挡住了 fork
+         stdout=FORK_BLOCKED_AT=22 [Errno 11] Resource temporarily unavailable
+  [PASS] 特权已丢弃：mount 不成功
+         stdout=MOUNT_DENIED
+
+  通过 53 / 53
+```
+
+> 以上是 `scripts/e2e-test.ps1` 的真实输出片段，不是示意。
 
 ## 目录
 
-- [它解决什么问题](#它解决什么问题)
-- [安全默认值](#安全默认值这个项目的重点)
+- [为什么做这个项目](#为什么做这个项目)
 - [快速开始](#快速开始)
-- [没装 Docker？用演练模式](#没装-docker用演练模式)
-- [接口](#接口)
-- [加一门语言](#加一门语言)
+- [用法](#用法)
 - [配置](#配置)
 - [项目结构](#项目结构)
-- [测试](#测试)
-- [⚠️ 部署前必读](#️-部署前必读)
+- [开发](#开发)
+- [常见问题](#常见问题)
 - [已知限制](#已知限制)
-- [文档](#文档)
+- [如何贡献](#如何贡献)
+- [许可证](#许可证)
 
----
+## 为什么做这个项目
 
-## 它解决什么问题
+跟着教程《在线代码执行器实现教程》学，但不想停在"能跑就行"。教程的实现里有几处安全上的将就——例如用 `docker cp` 把源码写进容器。那个做法在只读根文件系统下会直接失败（错误是 `container rootfs is marked read-only`），因为 `docker cp` 走的是守护进程侧的 rootfs 视图，看不到 tmpfs。本项目把它做成安全上站得住的版本。
 
-想验证一小段代码，却要装 IDE、装编译器、配环境——为了跑 3 行代码花 20 分钟。
-这个服务让你直接 POST 一段代码，它在加固过的容器里跑完，把结果还给你。
+目标读者：想学 Docker 容器隔离的后端开发者；需要给判题系统做沙箱、但不想直接上完整判题平台的团队。
 
-它不是玩具：**默认就是关起来的**。断网、只读文件系统、非 root、丢弃全部特权、
-内存/CPU/进程数/超时全都有硬上限。
+与 [Judge0](https://github.com/judge0/judge0) 的区别：Judge0 是完整的判题平台（数据库、队列、多语言包、Web 界面），上手重。本项目只做"沙箱这一层"的最小实现，把 15 项加固、每项的取舍理由、以及实测数据都摊开写清楚，可以当参考实现读。
 
----
+### 执行流程
 
-## 安全默认值（这个项目的重点）
+```mermaid
+sequenceDiagram
+    participant C as 调用方
+    participant A as 执行器 (Spring Boot)
+    participant P as 预热池
+    participant D as Docker 守护进程
+    participant S as 沙箱容器
 
-每个容器在创建时都会带上这些限制，**默认开启，没有开关可以关掉**。
-每一条都有真实容器的实测证据（见[安全设计](docs/04-安全设计.md)）：
-
-| 限制 | 作用 | 实测结果 |
-|---|---|---|
-| **API Key 鉴权** | 拦住"谁能调这个接口"。**默认开启，没配 key 就启动失败** | 不带 key → 401；带错 key → 401 |
-| `--network none` | 断网。挡住 SSRF 探测内网、外传数据、挖矿、当代理 | 连不上，DNS 也解析不出来 |
-| `--dns 127.0.0.1` | 不把宿主机 DNS 地址泄露给用户代码 | `/etc/resolv.conf` 里没有内网 IP |
-| `--read-only` | 根文件系统只读，改不了 `/etc`，装不了后门 | 写 `/etc` → `Read-only file system` |
-| `--tmpfs /workspace` | 唯一可写的地方是内存盘，容器一停就消失 | 可写，且不留痕 |
-| `--user 10001:10001` | 非 root 运行 | `getuid()` = 10001 |
-| `--cap-drop ALL` | 丢弃全部 Linux capability | `mount()` 被拒 |
-| `no-new-privileges` | 有 setuid 二进制也提不了权 | —— |
-| `--memory` + `--memory-swap` | 内存上限，且不给 swap | 超限 → `OUT_OF_MEMORY`，退出码 137 |
-| `--cpus 1` | 只给一个核 | —— |
-| `--pids-limit` | 进程数上限，挡 fork 炸弹 | 第 30 个进程被拒 |
-| `--ulimit` | 句柄数 / 进程数 / 单文件大小再各加一道 | —— |
-| 输出截断 | `while(true) print()` 打不爆执行器自己的内存 | 写 5MB → 只回传 64 KB |
-| 保命时长 | 容器最多活 `编译超时 + 运行超时 + 30s`，执行器崩了也不会永久泄漏 | —— |
-| 定时回收 | 扫 `code-executor.managed=true` 标签的孤儿容器 | 回收了旧的，**没有误杀**新的 |
-| 不用 `--rm` | 保留容器才能 inspect，判断"是超时还是 OOM" | 退出码 137 的两种情况被正确区分 |
-
----
+    C->>A: POST /api/v1/executions（X-API-Key）
+    A->>A: 鉴权 → 配额 → 参数校验
+    A->>A: 申请并发名额（拿不到即 429）
+    A->>P: 取一个预热好的容器
+    alt 池中有
+        P-->>A: 已创建并启动、从未使用过的容器
+    else 池中无
+        A->>D: 创建并启动容器
+    end
+    A->>S: exec：一次写入全部源文件与 stdin（base64 走 argv）
+    A->>S: exec：编译（仅编译型语言，可命中编译缓存）
+    A->>S: exec：运行，同时盯超时
+    S-->>A: stdout / stderr / 退出码
+    A->>D: 销毁容器（无论成功、报错、超时）
+    A-->>C: 结构化结果（SUCCESS / COMPILE_ERROR / RUNTIME_ERROR / TIMEOUT / OUT_OF_MEMORY）
+```
 
 ## 快速开始
 
-### 0. 前置条件
+前置要求：
 
-- JDK **17+**
-- Maven 3.9+
-- Docker（守护进程要真的在跑：`docker ps` 能出结果）
+| 依赖 | 版本要求 | 说明 |
+|---|---|---|
+| JDK | **17** | 本项目按 17 编译，用 11 会报 `class file version 61.0` |
+| Maven | 3.9+ | 或使用 IDE 内置的 |
+| Docker Engine | **20.10+** | 需要 `--pids-limit`、`--memory-swap`、tmpfs 支持；Windows 上用 Docker Desktop（WSL2 后端） |
 
-> **国内网络注意**：`docker build` 会去 `auth.docker.io` 拉基础镜像，这个域名在国内通常连不上。
-> 先配镜像加速，或者先把基础镜像拉下来改个名：
-> ```bash
-> docker pull docker.m.daocloud.io/library/eclipse-temurin:17-jdk-alpine
-> docker tag  docker.m.daocloud.io/library/eclipse-temurin:17-jdk-alpine eclipse-temurin:17-jdk-alpine
-> ```
+```sh
+git clone https://github.com/ChenChen913/code-executor.git
+cd code-executor
 
-### 1. 构建运行镜像
+# 1. 构建沙箱镜像。首次约 2 分钟。
+docker build --target runner-squashed -t code-executor-runner-min:1 .
 
-```bash
-docker build -t code-executor-runner:1 .
+# 2. 启动执行器。脚本会探测 JDK 17、检查 Docker、缺镜像则自动构建、生成 API Key。
+powershell -ExecutionPolicy Bypass -File scripts/start.ps1
 ```
 
-### 2. 启动服务
+脚本最后会打印生成的 API Key。看到 `Started CodeExecutorApplication` 即启动完成。
 
-先准备一个 API Key（**鉴权默认开启，没有 key 会启动失败**）：
+验证：
 
-```bash
-export EXECUTOR_AUTH_KEYS_0_NAME=my-app
-export EXECUTOR_AUTH_KEYS_0_VALUE=$(openssl rand -base64 32)
+```sh
+curl -s http://localhost:8080/actuator/health
+# {"status":"UP"}
 ```
 
-```powershell
-# Windows PowerShell
-$env:EXECUTOR_AUTH_KEYS_0_NAME = 'my-app'
-$env:EXECUTOR_AUTH_KEYS_0_VALUE = [Convert]::ToBase64String((1..32 | ForEach-Object { Get-Random -Max 256 }))
-```
+`/actuator/health` 是唯一免鉴权的端点，可直接接进 Kubernetes 或监控系统。
 
-然后启动：
+Linux / macOS 上没有 PowerShell 时，手动启动等价于：
 
-```bash
+```sh
+JAVA_HOME=/path/to/jdk17 \
+EXECUTOR_AUTH_KEYS_0_NAME=local \
+EXECUTOR_AUTH_KEYS_0_VALUE=local-key-0123456789abcdef \
 mvn spring-boot:run
 ```
 
-> 只想本地跑着玩、不想配 key：
-> `mvn spring-boot:run -Dspring-boot.run.arguments=--executor.auth.enabled=false`
-> （这个开关是刻意做得这么显眼的。）
+## 用法
 
-### 3. 跑一段代码
+提交一段 Java 代码，拿到结构化结果：
 
-```bash
-curl -X POST http://localhost:8080/api/v1/executions \
+```sh
+curl -s -X POST http://localhost:8080/api/v1/executions \
   -H 'Content-Type: application/json' \
-  -H "X-API-Key: $EXECUTOR_AUTH_KEYS_0_VALUE" \
-  -d '{"language":"python","code":"print(1+1)"}'
+  -H 'X-API-Key: <你的 key>' \
+  -d '{
+        "language": "java",
+        "code": "public class Main { public static void main(String[] a){ System.out.println(\"hi\"); } }"
+      }'
 ```
 
 ```json
 {
-  "jobId": "0f2c...",
-  "language": "python",
+  "jobId": "…",
+  "language": "java",
   "status": "SUCCESS",
   "success": true,
   "exitCode": 0,
-  "stdout": "2\n",
+  "stdout": "hi\n",
   "stderr": "",
-  "compileOutput": null,
+  "compileOutput": "",
   "truncated": false,
   "timedOut": false,
-  "durationMs": 442,
-  "message": "运行成功"
+  "durationMs": 289,
+  "compileCached": false
 }
 ```
 
----
+多文件与标准输入：
 
-## 没装 Docker？用演练模式
-
-不想装 Docker，或者只是想先看懂流程，加上这个参数：
-
-```bash
-mvn spring-boot:run -Dspring-boot.run.arguments=--executor.dry-run=true
+```sh
+curl -s -X POST http://localhost:8080/api/v1/executions \
+  -H 'Content-Type: application/json' -H 'X-API-Key: <你的 key>' \
+  -d '{
+        "language": "python",
+        "code": "import helper\nprint(helper.add(*map(int, input().split())))",
+        "files": { "helper.py": "def add(a, b):\n    return a + b\n" },
+        "stdin": "3 4\n"
+      }'
 ```
 
-这时**不会创建任何容器**，接口会把「将会下发给 Docker 的命令」原样渲染出来：
+异步提交，长任务不占连接：
 
-```
-docker run -d \
-  --name code-executor-... \
-  --user 10001:10001 \
-  --network none \
-  --read-only \
-  --tmpfs /workspace:rw,exec,nosuid,nodev,size=64m,mode=1777 \
-  --cap-drop ALL \
-  --security-opt no-new-privileges \
-  --memory 128m --memory-swap 128m \
-  --cpus 1 \
-  --pids-limit 32 \
-  code-executor-runner:1 \
-  sh -c "sleep 45"
+```sh
+# 提交，立刻拿到 taskId
+curl -s -X POST http://localhost:8080/api/v1/tasks \
+  -H 'Content-Type: application/json' -H 'X-API-Key: <你的 key>' \
+  -d '{"language":"java","code":"…"}'
+# {"taskId":"…","language":"java","status":"PENDING"}
+
+# 轮询
+curl -s http://localhost:8080/api/v1/tasks/<taskId> -H 'X-API-Key: <你的 key>'
 ```
 
----
+任务状态（`PENDING` / `RUNNING` / `COMPLETED` / `FAILED` / `CANCELLED`）与代码执行状态（`SUCCESS` / `COMPILE_ERROR` / …）是两层：前者说明"任务处理完了没有"，后者说明"代码跑得怎么样"。
 
-## 接口
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `POST` | `/api/v1/executions` | 执行代码 |
-| `GET` | `/api/v1/languages` | 支持的语言与各自配额 |
-| `GET` | `/actuator/health` | 健康检查 |
-
-**状态码约定**：只要执行本身完成了就返回 `200`——哪怕用户代码编译失败、超时、被 OOM 杀掉。
-这些都是"正常结果"，写在响应体的 `status` 字段里。只有"请求没能被执行"才用 4xx/5xx。
-
-| status | 含义 |
-|---|---|
-| `SUCCESS` | 跑完了，退出码 0 |
-| `COMPILE_ERROR` | 编译没过（`compileOutput` 里有原因） |
-| `RUNTIME_ERROR` | 编译过了，但进程非 0 退出（看 `stderr`） |
-| `TIMEOUT` | 超时，容器已被强制终止 |
-| `OUT_OF_MEMORY` | 内存超限，容器被内核杀掉 |
-| `DRY_RUN` | 演练模式，没有真正执行 |
-
-| HTTP | 场景 |
-|---|---|
-| `400` | 语言不支持 / 代码为空 / 代码超长 / JSON 格式错 |
-| `401` | 缺少或错误的 `X-API-Key` |
-| `429` | 并发已满（不排队，直接拒绝） |
-| `503` | Docker 连不上，或运行镜像没构建 |
-
-完整字段说明见[接口文档](docs/03-接口文档.md)。
-
----
-
-## 加一门语言
-
-**改配置就行，不用改 Java 代码。** 编辑 [`src/main/resources/languages.yml`](src/main/resources/languages.yml)：
-
-```yaml
-executor:
-  languages:
-    go:
-      display-name: Go 1.22
-      enabled: true
-      source-file-name: main.go
-      compile-command: [ "go", "build", "-o", "main", "main.go" ]
-      run-command: [ "./main" ]
-      compile-timeout-ms: 30000
-      run-timeout-ms: 5000
-      memory-mb: 256
-      pids-limit: 64
-```
-
-再去 `Dockerfile` 里加一层装上 `go` 就行了。
-
-> 命令一律写成**数组**，不要写成一整条字符串。数组形式下 Docker 会直接 `execve`，
-> 中间没有 shell，用户就不可能靠拼接参数注入额外命令。
-
----
+完整接口说明见 [docs/03-接口文档.md](docs/03-接口文档.md)，安全设计见 [docs/04-安全设计.md](docs/04-安全设计.md)。
 
 ## 配置
 
-全部参数在 [`application.yml`](src/main/resources/application.yml) 的 `executor.*` 下。最常改的几个：
+配置来自 `src/main/resources/application.yml`。环境变量形式是 Spring Boot 的松散绑定。
 
-| 配置 | 默认 | 说明 |
-|---|---|---|
-| `executor.auth.enabled` | `true` | API Key 鉴权。**没有配置 key 时启动失败** |
-| `executor.auth.header-name` | `X-API-Key` | 从哪个请求头取 key |
-| `executor.auth.keys[n].name` / `.value` | 空 | 调用方凭据。支持多个，用于 key 轮换 |
-| `executor.auth.public-paths` | `[/actuator/health]` | 免鉴权路径 |
-| `executor.image` | `code-executor-runner:1` | 运行用户代码的镜像 |
-| `executor.max-concurrent-executions` | `4` | 并发上限，超出返回 429 |
-| `executor.max-code-bytes` | `65536` | 单次提交代码上限，⚠️ **不要超过 90 KB** |
-| `executor.max-output-bytes` | `65536` | stdout/stderr 各自的上限 |
-| `executor.dry-run` | `false` | 演练模式 |
-| `executor.reaper.grace-seconds` | `120` | 孤儿容器保护期，**必须大于最长的一次执行** |
+<details>
+<summary>完整配置项（点击展开）</summary>
 
-> `max-code-bytes` 为什么有隐藏上限？源码是以 base64 形式作为命令行参数传进容器的，
-> 而 Linux 单个参数上限是 128 KiB，base64 会膨胀 1/3。
+| 配置键 | 环境变量 | 默认值 | 说明 |
+|---|---|---|---|
+| `executor.image` | `EXECUTOR_IMAGE` | `code-executor-runner:1` | 沙箱镜像名 |
+| `executor.auth.enabled` | `EXECUTOR_AUTH_ENABLED` | `true` | 关掉会丢弃全部鉴权，仅限本机调试 |
+| `executor.auth.keys[n].name` | `EXECUTOR_AUTH_KEYS_0_NAME` | 无 | 调用方标识，用于日志与配额 |
+| `executor.auth.keys[n].value` | `EXECUTOR_AUTH_KEYS_0_VALUE` | 无 | 密钥，**少于 16 字符拒绝启动** |
+| `executor.auth.keys[n].requests-per-minute` | `EXECUTOR_AUTH_KEYS_0_REQUESTS_PER_MINUTE` | `0`（用全局默认） | 单 key 覆盖；`-1` 不限 |
+| `executor.dry-run` | `EXECUTOR_DRYRUN` | `false` | 演练模式，不需要 Docker 即可跑通全流程 |
+| `executor.max-concurrent-executions` | `EXECUTOR_MAX_CONCURRENT_EXECUTIONS` | `4` | 全局并发上限，超出立即 429 |
+| `executor.max-code-bytes` | `EXECUTOR_MAX_CODE_BYTES` | `65536` | 单次代码体积上限 |
+| `executor.max-files` | `EXECUTOR_MAX_FILES` | `16` | 附加文件数量上限 |
+| `executor.max-output-bytes` | `EXECUTOR_MAX_OUTPUT_BYTES` | `65536` | stdout / stderr 各自的上限，超出截断并置 `truncated` |
+| `executor.workspace-size-mb` | `EXECUTOR_WORKSPACE_SIZE_MB` | `64` | `/workspace` 这个 tmpfs 的大小 |
+| `executor.pool.enabled` | `EXECUTOR_POOL_ENABLED` | `true` | 容器预热池 |
+| `executor.pool.warm-per-language` | `EXECUTOR_POOL_WARM_PER_LANGUAGE` | `1` | 每种语言预热几个 |
+| `executor.async.enabled` | `EXECUTOR_ASYNC_ENABLED` | `true` | 关掉后 `/api/v1/tasks` 返回 404 |
+| `executor.async.worker-threads` | `EXECUTOR_ASYNC_WORKER_THREADS` | `4` | 不应小于 `max-concurrent-executions` |
+| `executor.compile-cache.enabled` | `EXECUTOR_COMPILE_CACHE_ENABLED` | `true` | 编译产物缓存 |
+| `executor.quota.default-requests-per-minute` | `EXECUTOR_QUOTA_DEFAULT_REQUESTS_PER_MINUTE` | `60` | 每个调用方每分钟的执行次数上限 |
+| `executor.quota.default-daily-quota` | `EXECUTOR_QUOTA_DEFAULT_DAILY_QUOTA` | `5000` | 每个调用方每天的执行次数上限 |
+| `executor.seccomp-profile` | `EXECUTOR_SECCOMP_PROFILE` | 空 | 自定义 seccomp profile 的路径，见下 |
+| `server.port` | `SERVER_PORT` | `8080` | 监听端口 |
 
----
+</details>
+
+> `EXECUTOR_AUTH_KEYS_0_NAME`、`EXECUTOR_AUTH_KEYS_0_VALUE`、`EXECUTOR_IMAGE` 三个变量形式经过实测；其余为 Spring Boot 松散绑定的对应形式。
+
+### seccomp profile
+
+`docker/seccomp-profile.json` 在 Docker 默认 profile 之上，额外拒绝 `ptrace`、`bpf`、`mount`、`kexec_load`、内核 keyring、`userfaultfd` 等沙箱里用不到的系统调用。
+
+```sh
+# Linux 上：把文件放到守护进程能读到的地方，再指向它
+sudo cp docker/seccomp-profile.json /etc/code-executor/seccomp-profile.json
+# 启动时加：--executor.seccomp-profile=/etc/code-executor/seccomp-profile.json
+```
+
+> ⚠️ 这个路径是 **Docker 守护进程所在机器**上的路径，不是执行器进程看到的路径。Docker Desktop for Windows 的守护进程跑在 WSL 虚拟机里，读不到 Windows 侧的文件，因此该配置在 Windows 上无法生效。实际拦截效果需要在 Linux 上验证。
 
 ## 项目结构
 
 ```
-src/main/java/com/chenchen/codeexecutor/
-├── core/
-│   ├── SandboxPolicy.java      ← 所有容器加固规则集中在这里，一眼看全
-│   ├── DockerCodeRunner.java   ← 真跑：创建容器 → 写代码 → 编译 → 运行 → 清理
-│   ├── DryRunCodeRunner.java   ← 演练：只渲染命令，不碰 Docker
-│   ├── ExecutionService.java   ← 校验 + 并发限制
-│   ├── ContainerReaper.java    ← 孤儿容器定时回收
-│   └── BoundedOutputStream.java← 输出截断，防 while(true) print
-├── language/                   ← 语言抽象与注册表
-├── model/                      ← 请求/响应/状态
-├── security/                   ← API Key 鉴权（过滤器 + 纯逻辑校验器）
-└── web/                        ← REST 接口与统一错误处理
-
-scripts/e2e-test.ps1            ← 53 项真实容器端到端测试（含鉴权、异步、缓存与安全回归）
-docs/                           ← 需求分析 / 部署 / 接口 / 安全 / 测试报告
+code-executor/
+├── Dockerfile                    4 层：runner-base → polyglot → minimal → squashed（推荐）
+├── docker/seccomp-profile.json   自定义 seccomp 策略
+├── pom.xml                       Spring Boot 3.5.16 / Java 17
+├── scripts/
+│   ├── start.ps1                 一键启动（探测 JDK、检查 Docker、构建镜像、生成 key）
+│   ├── e2e-test.ps1              53 项真实容器端到端断言
+│   ├── benchmark.ps1             延迟分布测量
+│   ├── demo.ps1                  演示脚本
+│   └── watch-container.ps1       实时观察容器生命周期
+├── docs/                         设计、部署、接口、安全、测试报告、进度交接
+└── src/main/java/com/chenchen/codeexecutor/
+    ├── core/                     沙箱核心
+    │   ├── SandboxPolicy.java        全部 15 项加固参数的唯一出处
+    │   ├── ContainerFactory.java     创建/销毁容器的唯一入口
+    │   ├── ContainerPool.java        预热池（预热但不复用）
+    │   ├── DockerCodeRunner.java     一次执行的完整流程
+    │   ├── CompileCache.java         编译产物缓存
+    │   └── ContainerReaper.java      孤儿容器回收与对账
+    ├── security/                 API Key 鉴权与按调用方配额
+    ├── language/                 语言配方（超时/内存/pids/命令）
+    ├── model/                    请求、响应、状态枚举
+    └── web/                      HTTP 接口与统一错误处理
 ```
 
----
+改动前建议先读 [docs/06-进度与交接.md](docs/06-进度与交接.md) 末尾的「关键设计决定」，那里写了四处刻意为之的取舍（为什么容器绝不复用、为什么不做 webhook 等）。
 
-## 测试
+## 开发
 
-```bash
-mvn test                                        # 115 个单元/集成测试，不需要 Docker
-
-mvn spring-boot:run                             # 终端 1（记得配 API Key）
-powershell -File scripts/e2e-test.ps1           # 终端 2：53 项真实容器断言
+```sh
+mvn -B test                                          # 115 个单元/集成测试，不需要 Docker
+mvn -B clean package                                 # 打包
+powershell -File scripts/e2e-test.ps1 -ApiKey <key>  # 53 项真实容器断言，需要 Docker
+powershell -File scripts/benchmark.ps1 -ApiKey <key> # 测量执行延迟分布
 ```
 
-端到端脚本覆盖四块：**鉴权**、功能（三种语言）、错误分类（编译错/运行错/超时/OOM/截断）、
-**安全回归（断网/只读/非 root/进程数限制/清理无残留）**。
+改代码前建议知道两件事：
 
-> 鉴权和安全回归那两节的断言都是**回归保护**：
-> 以后有人为了图方便把鉴权关掉、或者删掉 `--network none`，脚本会直接红掉。
+1. **单元测试过了不代表真容器能跑。** 这个项目里若干问题只有真实容器测试才暴露。例如回收器误杀正在执行的容器时，表现为"死循环程序跑 2 秒就异常退出，单独测又正常"。改完请两套都跑。
+2. **`scripts/` 下的 `.ps1` 必须存为「UTF-8 带 BOM」。** PowerShell 5.1 会按 ANSI 读取 `.ps1`，中文注释会导致解析失败，报错信息是 `意外的标记 "[PASS]"` 这类内容。
 
----
+## 常见问题
 
-## ⚠️ 部署前必读
+**Q：`mvn` 报 `class file version 61.0`？**
+A：`JAVA_HOME` 指向了 JDK 11。本项目需要 JDK 17：`set JAVA_HOME=D:\java\jdk17`（Windows）或 `export JAVA_HOME=/path/to/jdk17`。
 
-### 1. 鉴权已默认开启，但它是静态共享密钥
+**Q：启动时报镜像找不到？**
+A：先构建镜像 `docker build --target runner-squashed -t code-executor-runner-min:1 .`，再用 `--executor.image=code-executor-runner-min:1` 启动。
 
-`executor.auth.enabled` 默认 `true`，没配 key 就起不来。但它有明确的边界：
+**Q：一直返回 `503`，提示连不上 Docker 守护进程？**
+A：Docker 没启动，或 `executor.docker.host` 配错了。执行器把"环境没准备好"（503）和"执行器自己出错"（500）分开，看到 503 就先查 Docker。
 
-- **是共享密钥，不是身份体系。** 所有拿到同一个 key 的调用方在服务端看起来是同一个人，
-  日志里只有你给这个 key 起的 `name`
-- **没有过期、没有自动轮换。** 轮换靠配置多个 key 手工做：
-  加新 key → 部署 → 切换调用方 → 删旧 key
-- **没有按 key 的配额。** 一个 key 被打满，其他 key 一起受影响（M2）
-- **不做 TLS。** 这个服务只跑 HTTP，**必须由反向代理终止 HTTPS**，
-  否则 key 在网络上是明文
+**Q：`docker build` 卡在拉取基础镜像？**
+A：国内直连 Docker Hub 常常不通。给 Docker Desktop 配镜像加速（例如 `docker.m.daocloud.io`）。`FROM scratch` 那层不需要拉取。
 
-### 2. 不要把执行器容器化后挂 `docker.sock`
+**Q：返回 `429`？**
+A：两种可能。并发名额满了（同步接口不排队，直接快速失败），或触发了调用方配额。响应体的 `message` 会写明是哪一种。
 
-```yaml
-# ❌ 绝对不要这样做
-volumes:
-  - /var/run/docker.sock:/var/run/docker.sock
-```
+**Q：轮询任务返回 `404`？**
+A：任务结果有 TTL（默认 600 秒），过期即清理。另外任务状态存在内存里，重启执行器会清空。
 
-执行器持有 Docker socket，而 **Docker socket 等价于宿主机 root**——
-能访问它的人可以让 Docker 起一个挂载宿主机根目录的容器。
-鉴权能挡住"随便什么人都能调接口"，但**挡不住拿到 key 之后的横向移动**。
-
-正确做法：执行器作为普通进程直接跑在宿主机上（systemd 示例见[部署文档](docs/02-部署文档.md)），
-用防火墙限制来源。
-
-### 3. 生产环境还缺什么
-
-鉴权只是让"能部署"这件事成立。离生产还有（详见[安全设计](docs/04-安全设计.md)第 4 节）：
-
-- 按调用方的配额与限流（M2）
-- 可观测：执行成功率、耗时分布、被杀原因统计（M2）
-- seccomp 自定义 profile、最小化镜像（M2）
-- 独立节点部署，与主业务、数据库物理隔离（M2）
-
----
+**Q：为什么 Python 用 `-E -s` 而不是 `-I`？**
+A：`-I` 隐含 `-P`，会把脚本所在目录从 `sys.path` 里去掉，导致 `import helper` 这类同目录导入失败。`-E -s` 只隔离环境变量和用户 site-packages，保留脚本目录。
 
 ## 已知限制
 
-- **鉴权是静态共享密钥**，没有过期、没有自动轮换、没有按 key 的配额
-- **不做排队**，并发满了直接 429
-- **同步接口**，编译型语言慢的时候调用方要自己等
-- **每请求一个容器**，冷启动开销实在（容器池在路线图上）
-- **seccomp 用的是 Docker 默认 profile**，没做更严的自定义策略
-- **只读根文件系统仍然可读系统文件**（数据出不去，但信息会被看到）
-- 不支持 stdin、多文件、自定义命令行参数
-- **没有做过压测**，并发上限 4 是拍脑袋定的
+完整清单见 [docs/06-进度与交接.md](docs/06-进度与交接.md)。以下是影响使用的部分：
 
-完整的残余风险清单在[安全设计第 4 节](docs/04-安全设计.md#4-残余风险诚实清单)，
-路线图在[需求分析第 9 章](docs/01-需求分析和设计.md#第-9-章--实施路线图)。
+- **只支持三种语言**：Java、Python 3、JavaScript（Node）。加语言需要改 `src/main/resources/languages.yml` 与运行镜像。
+- **无持久化**。执行结果、异步任务、编译缓存、调用方配额全部存在进程内存里：重启即清空，且**无法多节点部署**。
+- **异步任务不能取消正在执行的任务**。`DELETE` 只对排队中的任务有效，执行中的返回 `409`。杀容器是另一套机制。
+- **没有 webhook 回调**。执行器跑在内网且持有 `docker.sock`，让它主动 POST 到调用方指定的 URL 是现成的 SSRF 通道。异步结果只能轮询。
+- **seccomp 自定义 profile 在 Windows + Docker Desktop 上无法生效**（守护进程跑在 WSL 里，读不到 Windows 侧的文件）。实际拦截效果需要在 Linux 上验证。
+- **gVisor / Kata Containers 未实现**。开发机是 Windows + Docker Desktop，装不了 `runsc`。当前隔离强度 = namespace + cgroup + capability + seccomp + 只读根文件系统，**共享宿主机内核**。
+- **单节点**。横向扩展需要先把任务状态、编译缓存、配额外置到 Redis。
+- **预热池在高并发下的表现未验证**。端到端测试是顺序执行的。
+- **最小化镜像只是减小可读面**。`--readonly` 挡不住读，镜像里有什么用户就能看到什么。`runner-squashed` 把镜像从 653MB 降到 484MB、容器内文件从 2837 个降到 2540 个，但这不等于安全隔离。
 
----
+## 如何贡献
 
-## Windows 用户注意
+欢迎提 Issue 和 PR：[Issues](https://github.com/ChenChen913/code-executor/issues)。
 
-如果控制台里中文日志显示成乱码（`�Ѽ���`），那是控制台代码页的问题，
-不是服务的问题（接口返回的 JSON 是标准 UTF-8）。执行一次即可：
+提交信息用约定式提交（Conventional Commits）：`type(scope): 摘要`，摘要用中文祈使句、结尾不加句号。类型用 `feat` / `fix` / `docs` / `refactor` / `perf` / `test` / `build` / `ci` / `chore`。
 
-```powershell
-chcp 65001
-```
+改动的验证要求：`mvn -B test` 与 `scripts/e2e-test.ps1` 两套都要过。新增的安全相关行为，请在 `scripts/e2e-test.ps1` 里加一条断言。
 
----
+## 许可证
 
-## 文档
-
-| 文档 | 内容 |
-|---|---|
-| [01 需求分析与设计](docs/01-需求分析和设计.md) | 原文整理 + 逐条评审 + 改进设计 + **第 0 章：容器隔离的底层机制** |
-| [02 部署文档](docs/02-部署文档.md) | 环境准备、配置全表、生产部署、故障排查 |
-| [03 接口文档](docs/03-接口文档.md) | 完整字段说明、状态机、多语言调用示例 |
-| [04 安全设计](docs/04-安全设计.md) | 威胁模型、加固清单与实测证据、**残余风险** |
-| [05 测试报告](docs/05-测试报告.md) | 测试分层、真实数据、**测试中发现的 4 个缺陷**、没测到的部分 |
-
-## License
-
-MIT
+[MIT](LICENSE)
